@@ -1,0 +1,9 @@
+-r requirements.txt
+torch
+torchvision
+spandrel>=0.4
+safetensors>=0.4
+# Optional alternatives depending on your model collection:
+# realesrgan
+# basicsr
+# torch-directml; platform_system == "Windows"

@@ -1,0 +1,27 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 9, 0, 22),
+    prodvers=(0, 9, 0, 22),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'Regendx'),
+         StringStruct(u'FileDescription', u'ImageSuite desktop image toolkit'),
+         StringStruct(u'FileVersion', u'0.9.0 RC22'),
+         StringStruct(u'InternalName', u'ImageSuite'),
+         StringStruct(u'LegalCopyright', u'Copyright Regendx'),
+         StringStruct(u'OriginalFilename', u'ImageSuite.exe'),
+         StringStruct(u'ProductName', u'ImageSuite'),
+         StringStruct(u'ProductVersion', u'0.9.0 RC22')])
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

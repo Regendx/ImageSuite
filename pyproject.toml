@@ -1,0 +1,22 @@
+[project]
+name = "regendx-imagesuite"
+version = "0.9.0rc22"
+description = "Unified PySide6 image editor, upscaler, watermarker, and visual similarity cleaner"
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6>=6.7",
+  "Pillow>=11.0",
+  "numpy>=1.26",
+  "send2trash>=1.8",
+  "imageio>=2.34",
+  "imageio-ffmpeg>=0.5",
+]
+
+[project.optional-dependencies]
+ai = ["torch", "torchvision", "spandrel>=0.4", "safetensors>=0.4"]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

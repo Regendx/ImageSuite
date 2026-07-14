@@ -1,0 +1,1 @@
+"""Visual similarity scanning workspace."""
