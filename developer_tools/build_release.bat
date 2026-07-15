@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0\.."
-set "VERSION=0.9.0-RC22"
+set "VERSION=0.9.0-RC33"
 call developer_tools\build_exe.bat --no-pause
 if errorlevel 1 exit /b 1
 

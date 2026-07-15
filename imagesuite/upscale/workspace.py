@@ -458,10 +458,15 @@ class UpscaleWorkspace(QWidget):
         if not hasattr(self, "format") or not hasattr(self, "resize_form"):
             return
         fmt = self.format.currentText()
-        is_gif = fmt == "GIF"
         is_video = fmt in {"MP4", "WebM"}
         self.preserve_alpha.setEnabled(not is_video)
         self.preserve_alpha.setToolTip("Video exports flatten transparency onto black." if is_video else "Preserve transparency when the chosen format supports it.")
+        self.preserve_audio.setEnabled(is_video)
+        self.preserve_audio.setToolTip(
+            "Attach the source MP4/WebM audio after processing the new video frames."
+            if is_video
+            else "Source audio is available only for MP4/WebM output."
+        )
         self._set_resize_advanced(self.resize_advanced.isChecked())
         if is_video:
             self.status.setText("MP4/WebM export works for animated sources. Still images should use PNG, JPEG, WebP, TIFF, or GIF.")
@@ -597,6 +602,7 @@ class UpscaleWorkspace(QWidget):
         self.gif_dither.setChecked(True)
         self.gif_optimize = QCheckBox("Optimize GIF size")
         self.preserve_alpha = QCheckBox("Preserve transparency"); self.preserve_alpha.setChecked(True)
+        self.preserve_audio = QCheckBox("Preserve source video audio"); self.preserve_audio.setChecked(True)
         self.timestamp_folder = QCheckBox("Create timestamped output folder"); self.timestamp_folder.setChecked(True)
         self.export_zip = QCheckBox("Export completed queue as ZIP")
         self.skip_larger = QCheckBox("Skip sources already at or above target size")
@@ -635,12 +641,13 @@ class UpscaleWorkspace(QWidget):
         form.addRow("", self.gif_dither)
         form.addRow("", self.gif_optimize)
         form.addRow("", self.preserve_alpha)
+        form.addRow("", self.preserve_audio)
         form.addRow("", self.timestamp_folder)
         form.addRow("", self.export_zip)
         form.addRow("", self.skip_larger)
         self.resize_form = form
         self.ai_fields = [self.model_row, self.ai_profile, self.device, self.ai_precision, self.tile, self.ai_preview_size, self.ai_oom_recovery, self.ai_status]
-        self.resize_advanced_fields = [self.jpeg_quality, self.webp_quality, self.animation_fps, self.video_bitrate, self.gif_colors, self.gif_dither, self.gif_optimize, self.preserve_alpha, self.timestamp_folder, self.export_zip, self.skip_larger]
+        self.resize_advanced_fields = [self.jpeg_quality, self.webp_quality, self.animation_fps, self.video_bitrate, self.gif_colors, self.gif_dither, self.gif_optimize, self.preserve_alpha, self.preserve_audio, self.timestamp_folder, self.export_zip, self.skip_larger]
         for widget in (self.model, self.device, self.ai_precision, self.tile, self.ai_preview_size):
             if isinstance(widget, QComboBox):
                 widget.currentTextChanged.connect(self._ai_control_changed)
@@ -687,13 +694,12 @@ class UpscaleWorkspace(QWidget):
     def _set_resize_advanced(self, visible: bool) -> None:
         if not hasattr(self, "resize_form"):
             return
-        ai = hasattr(self, "method") and self.method.currentText() == "AI model"
         fmt = self.format.currentText() if hasattr(self, "format") else "PNG"
         is_gif = fmt == "GIF"
         is_video = fmt in {"MP4", "WebM"}
         for field in self.resize_advanced_fields:
             show = visible
-            if field in {self.animation_fps, self.video_bitrate}:
+            if field in {self.animation_fps, self.video_bitrate, self.preserve_audio}:
                 show = visible and is_video
             elif field in {self.gif_colors, self.gif_dither, self.gif_optimize}:
                 show = visible and is_gif
@@ -969,7 +975,7 @@ class UpscaleWorkspace(QWidget):
     def settings(self) -> UpscaleSettings:
         model_path = self.model.currentData() or ""
         return UpscaleSettings(
-            mode=self.mode.currentText(), scale_factor=self.scale.value(), target_width=self.target_w.value(), target_height=self.target_h.value(), method=self.method.currentText(), model_path=str(model_path), device=self.device.currentText(), tile_size=self.tile.value(), ai_precision=self.ai_precision.currentText(), ai_oom_recovery=self.ai_oom_recovery.isChecked(), ai_preview_max_side=self.ai_preview_size.value(), output_format=self.format.currentText(), jpeg_quality=self.jpeg_quality.value(), webp_quality=self.webp_quality.value(), animation_fps=self.animation_fps.value(), video_bitrate_kbps=self.video_bitrate.value(), gif_colors=self.gif_colors.value(), gif_dither=self.gif_dither.isChecked(), gif_optimize=self.gif_optimize.isChecked(), preserve_transparency=self.preserve_alpha.isChecked(), preserve_metadata=self.preserve_metadata, create_timestamped_folder=self.timestamp_folder.isChecked(), export_zip=self.export_zip.isChecked(), skip_if_larger=self.skip_larger.isChecked(), max_workers=self.max_workers.value(), sharpen=self.sharpen.value(), denoise=self.denoise.value(), contrast=self.contrast.value(), brightness=self.brightness.value(), saturation=self.saturation.value(), text_watermark=self.text_enable.isChecked(), watermark_text=self.text_value.text(), font_path=self.font_path.text(), font_size=self.font_size.value(), text_rotation=self.text_rotation.value(), font_color=self.font_color.text(), text_opacity=self.text_opacity.value(), text_anchor=self.anchor.currentText(), text_x_percent=self.text_x.value(), text_y_percent=self.text_y.value(), margin_x=self.margin_x.value(), margin_y=self.margin_y.value(), outline=self.outline.isChecked(), outline_color=self.outline_color.text(), outline_width=self.outline_width.value(), shadow=self.shadow.isChecked(), shadow_offset=self.shadow_offset.value(), shadow_opacity=self.shadow_opacity.value(), background=self.background.isChecked(), background_color=self.background_color.text(), background_opacity=self.background_opacity.value(), image_watermark=self.image_enable.isChecked(), image_watermark_path=self.logo_path.text(), image_scale=self.logo_scale.value(), image_opacity=self.logo_opacity.value(), image_x_percent=self.logo_x.value(), image_y_percent=self.logo_y.value(),
+            mode=self.mode.currentText(), scale_factor=self.scale.value(), target_width=self.target_w.value(), target_height=self.target_h.value(), method=self.method.currentText(), model_path=str(model_path), device=self.device.currentText(), tile_size=self.tile.value(), ai_precision=self.ai_precision.currentText(), ai_oom_recovery=self.ai_oom_recovery.isChecked(), ai_preview_max_side=self.ai_preview_size.value(), output_format=self.format.currentText(), jpeg_quality=self.jpeg_quality.value(), webp_quality=self.webp_quality.value(), animation_fps=self.animation_fps.value(), video_bitrate_kbps=self.video_bitrate.value(), gif_colors=self.gif_colors.value(), gif_dither=self.gif_dither.isChecked(), gif_optimize=self.gif_optimize.isChecked(), preserve_transparency=self.preserve_alpha.isChecked(), preserve_audio=self.preserve_audio.isChecked(), preserve_metadata=self.preserve_metadata, create_timestamped_folder=self.timestamp_folder.isChecked(), export_zip=self.export_zip.isChecked(), skip_if_larger=self.skip_larger.isChecked(), max_workers=self.max_workers.value(), sharpen=self.sharpen.value(), denoise=self.denoise.value(), contrast=self.contrast.value(), brightness=self.brightness.value(), saturation=self.saturation.value(), text_watermark=self.text_enable.isChecked(), watermark_text=self.text_value.text(), font_path=self.font_path.text(), font_size=self.font_size.value(), text_rotation=self.text_rotation.value(), font_color=self.font_color.text(), text_opacity=self.text_opacity.value(), text_anchor=self.anchor.currentText(), text_x_percent=self.text_x.value(), text_y_percent=self.text_y.value(), margin_x=self.margin_x.value(), margin_y=self.margin_y.value(), outline=self.outline.isChecked(), outline_color=self.outline_color.text(), outline_width=self.outline_width.value(), shadow=self.shadow.isChecked(), shadow_offset=self.shadow_offset.value(), shadow_opacity=self.shadow_opacity.value(), background=self.background.isChecked(), background_color=self.background_color.text(), background_opacity=self.background_opacity.value(), image_watermark=self.image_enable.isChecked(), image_watermark_path=self.logo_path.text(), image_scale=self.logo_scale.value(), image_opacity=self.logo_opacity.value(), image_x_percent=self.logo_x.value(), image_y_percent=self.logo_y.value(),
         )
 
     def _selected_model_summary(self) -> str:

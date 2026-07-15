@@ -1,6 +1,6 @@
 [project]
 name = "regendx-imagesuite"
-version = "0.9.0rc22"
+version = "0.9.0rc33"
 description = "Unified PySide6 image editor, upscaler, watermarker, and visual similarity cleaner"
 requires-python = ">=3.10"
 dependencies = [
@@ -8,7 +8,6 @@ dependencies = [
   "Pillow>=11.0",
   "numpy>=1.26",
   "send2trash>=1.8",
-  "imageio>=2.34",
   "imageio-ffmpeg>=0.5",
 ]
 

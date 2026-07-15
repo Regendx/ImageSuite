@@ -71,7 +71,6 @@ def test_release_metadata_matches_runtime_version() -> None:
 
 def test_core_requirements_include_animation_runtime_dependencies() -> None:
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
-    assert "imageio>=" in requirements
     assert "imageio-ffmpeg>=" in requirements
 
 
@@ -88,7 +87,8 @@ def test_dependency_check_covers_every_core_import() -> None:
     import dependency_check
 
     modules = {module for _display, module in dependency_check.CORE_DEPENDENCIES}
-    assert {"PySide6", "PIL", "numpy", "send2trash", "imageio", "imageio_ffmpeg"} <= modules
+    assert {"PySide6", "PIL", "numpy", "send2trash", "imageio_ffmpeg"} <= modules
+    assert "imageio" not in modules
 
 
 def test_dependency_check_reports_exact_missing_module(monkeypatch) -> None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import sys
 import traceback
 
 CORE_DEPENDENCIES = (
@@ -10,7 +9,6 @@ CORE_DEPENDENCIES = (
     ("Pillow", "PIL"),
     ("NumPy", "numpy"),
     ("Send2Trash", "send2trash"),
-    ("ImageIO", "imageio"),
     ("ImageIO-FFmpeg", "imageio_ffmpeg"),
 )
 

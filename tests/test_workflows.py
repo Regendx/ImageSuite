@@ -225,3 +225,291 @@ def test_job_manager_bounds_long_session_history():
         manager.create(f"Job {index}", "Test")
     assert len(manager.jobs) == 200
     assert manager.jobs[0].name == "Job 249"
+
+
+def test_custom_animation_export_does_not_replace_open_document(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QDialog
+    from imagesuite.editor.workspace import AnimationExportDialog
+    from imagesuite.models import ImageDocument
+    from imagesuite.utils import read_image, save_animation
+
+    _app()
+    source = tmp_path / "source.gif"
+    target = tmp_path / "clip.gif"
+    frames = [Image.new("RGBA", (12, 10), color) for color in ("red", "green", "blue")]
+    save_animation(frames, [200, 200, 200], source)
+
+    workspace = EditorWorkspace()
+    workspace.add_document(read_image(source), source, dirty=True)
+    document = workspace.document
+    assert document is not None and document.dirty
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(target), "Animated GIF (*.gif)"))
+    monkeypatch.setattr(AnimationExportDialog, "exec", lambda self: QDialog.Accepted)
+    monkeypatch.setattr(
+        AnimationExportDialog,
+        "options",
+        lambda self: {
+            "start_ms": 100,
+            "duration_ms": 300,
+            "output_duration_ms": 900,
+            "gif_colors": 128,
+            "gif_dither": False,
+            "gif_optimize": False,
+            "fps": 0,
+            "bitrate_kbps": 0,
+        },
+    )
+
+    assert workspace.save_as()
+    assert target.exists()
+    assert document.path == source
+    assert document.dirty
+    exported = ImageDocument.from_image(read_image(target))
+    assert exported.animation_duration_ms == 900
+    exported.close()
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_unedited_mp4_can_export_directly_from_source_video(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QDialog
+    from imagesuite.editor import workspace as workspace_module
+    from imagesuite.editor.workspace import AnimationExportDialog
+    from imagesuite.utils import read_image, save_animation
+
+    _app()
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "clip.mp4"
+    frames = [Image.new("RGBA", (16, 12), color) for color in ("red", "green", "blue", "white", "black", "yellow")]
+    save_animation(frames, [100] * len(frames), source, fps=10)
+
+    workspace = EditorWorkspace()
+    workspace.add_document(
+        read_image(source, video_options={"start_ms": 100, "duration_ms": 500, "target_fps": 5, "max_side": 16}),
+        source,
+    )
+    document = workspace.document
+    assert document is not None and document.direct_video_source == source.resolve()
+
+    calls: list[tuple[Path, Path, int, int]] = []
+
+    def fake_direct(source_path, target_path, *, start_ms, duration_ms, fps=0, bitrate_kbps=0, preserve_audio=True):
+        calls.append((Path(source_path), Path(target_path), start_ms, duration_ms))
+        Path(target_path).write_bytes(b"video")
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(target), "MP4 video (*.mp4)"))
+    monkeypatch.setattr(AnimationExportDialog, "exec", lambda self: QDialog.Accepted)
+    monkeypatch.setattr(
+        AnimationExportDialog,
+        "options",
+        lambda self: {
+            "start_ms": 100,
+            "duration_ms": 300,
+            "output_duration_ms": 300,
+            "gif_colors": 256,
+            "gif_dither": True,
+            "gif_optimize": False,
+            "fps": 0,
+            "bitrate_kbps": 0,
+            "direct_video": True,
+        },
+    )
+    monkeypatch.setattr(workspace_module, "export_video_segment", fake_direct)
+    monkeypatch.setattr(workspace_module, "save_animation", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rendered path used")))
+
+    assert workspace.save_as()
+    assert calls == [(source.resolve(), target, 200, 300)]
+    assert document.path == source
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_edited_video_export_preserves_source_audio_via_rendered_path(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QDialog
+    from imagesuite.editor import workspace as workspace_module
+    from imagesuite.editor.workspace import AnimationExportDialog
+    from imagesuite.utils import read_image, save_animation as real_save_animation
+
+    _app()
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "edited.mp4"
+    frames = [Image.new("RGBA", (16, 12), color) for color in ("red", "green", "blue", "white")]
+    real_save_animation(frames, [100] * len(frames), source, fps=10)
+
+    workspace = EditorWorkspace()
+    workspace.add_document(
+        read_image(source, video_options={"start_ms": 100, "duration_ms": 300, "target_fps": 10, "max_side": 16}),
+        source,
+    )
+    document = workspace.document
+    assert document is not None
+    document.commit_frames([frame.copy() for frame in document.animation_frames], durations=list(document.frame_durations))
+    assert document.direct_video_source is None
+    assert document.source_video == source.resolve()
+
+    captured: dict[str, object] = {}
+
+    def fake_save(frames, durations, path, **kwargs):
+        captured.update(kwargs)
+        Path(path).write_bytes(b"rendered")
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(target), "MP4 video (*.mp4)"))
+    monkeypatch.setattr(AnimationExportDialog, "exec", lambda self: QDialog.Accepted)
+    monkeypatch.setattr(
+        AnimationExportDialog,
+        "options",
+        lambda self: {
+            "start_ms": 0,
+            "duration_ms": document.animation_duration_ms,
+            "output_duration_ms": document.animation_duration_ms,
+            "gif_colors": 256,
+            "gif_dither": True,
+            "gif_optimize": False,
+            "fps": 0,
+            "bitrate_kbps": 0,
+            "direct_video": False,
+            "preserve_audio": True,
+        },
+    )
+    monkeypatch.setattr(workspace_module, "save_animation", fake_save)
+
+    assert workspace.save_as()
+    assert captured["audio_source"] == source.resolve()
+    assert captured["audio_start_ms"] == 100
+    assert captured["audio_duration_ms"] == document.animation_duration_ms
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_closing_tabs_detaches_closed_document_and_keeps_background_selection():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (20, 20), "red"))
+    first = workspace.document
+    workspace.add_document(Image.new("RGBA", (20, 20), "green"))
+    second = workspace.document
+    workspace.add_document(Image.new("RGBA", (20, 20), "blue"))
+    third = workspace.document
+    assert first is not None and second is not None and third is not None
+
+    workspace.close_document(0)
+    assert workspace.document is third
+    assert workspace.canvas.document is third
+
+    workspace.close_document(1)
+    assert workspace.document is second
+    assert workspace.canvas.document is second
+    before = second.image_revision
+    workspace.effect_combo.setCurrentText("Pixelate")
+    workspace.apply_effect()
+    assert second.image_revision > before
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_closing_background_tab_preserves_active_preview_state():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (24, 18), "red"))
+    workspace.add_document(Image.new("RGBA", (24, 18), "green"))
+    active = workspace.document
+    assert active is not None
+    preview = Image.new("RGBA", (24, 18), "blue")
+    workspace.canvas.preview_image = preview
+    workspace._preview_kind = "effect"
+    workspace._requested_preview_kind = "effect"
+
+    workspace.close_document(0)
+
+    assert workspace.document is active
+    assert workspace.canvas.document is active
+    assert workspace.canvas.preview_image is preview
+    assert workspace._preview_kind == "effect"
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_animation_recovery_uses_owned_frame_copies(tmp_path: Path):
+    from imagesuite.models import ANIMATION_DURATIONS_KEY, ANIMATION_FRAMES_KEY
+
+    _app()
+    workspace = EditorWorkspace()
+    workspace.recovery_dir = tmp_path
+    frames = [Image.new("RGBA", (12, 10), color) for color in ("red", "green", "blue")]
+    image = frames[0].copy()
+    image.info[ANIMATION_FRAMES_KEY] = frames
+    image.info[ANIMATION_DURATIONS_KEY] = [100, 100, 100]
+    workspace.add_document(image, dirty=True)
+    document = workspace.document
+    assert document is not None
+    original_ids = {id(frame) for frame in document.animation_frames}
+    captured: list[Image.Image] = []
+
+    def fake_recovery(image, image_path, meta_path, payload, animation_frames=None, frame_durations=None, animation_loop=0):
+        captured.extend(animation_frames or [])
+        for frame in animation_frames or []:
+            frame.close()
+
+    workspace._write_recovery = fake_recovery
+    workspace._autosave()
+    for future in workspace._recovery_futures.values():
+        future.result(timeout=5)
+    assert captured
+    assert not original_ids.intersection(id(frame) for frame in captured)
+    assert document.image.getpixel((0, 0))
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_decoder_owned_images_are_released_only_when_explicitly_consumed():
+    import pytest
+
+    _app()
+    workspace = EditorWorkspace()
+    source = Image.new("RGBA", (14, 10), "purple")
+    workspace.add_document(source, consume=True)
+    with pytest.raises(ValueError, match="closed image"):
+        source.getpixel((0, 0))
+    assert workspace.document is not None
+    assert workspace.document.image.getpixel((0, 0))[:3] == (128, 0, 128)
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_animation_playback_reuses_timing_tables(monkeypatch):
+    import time
+    from imagesuite.models import ANIMATION_DURATIONS_KEY, ANIMATION_FRAMES_KEY
+
+    _app()
+    workspace = EditorWorkspace()
+    frames = [Image.new("RGBA", (10, 8), color) for color in ("red", "green", "blue", "white")]
+    image = frames[0].copy()
+    image.info[ANIMATION_FRAMES_KEY] = frames
+    image.info[ANIMATION_DURATIONS_KEY] = [40, 60, 80, 100]
+    workspace.add_document(image)
+    monkeypatch.setattr(workspace, "_show_animation_frame", lambda *args, **kwargs: None)
+    workspace._gif_playing = True
+    workspace._gif_playback_started = time.perf_counter()
+    workspace._advance_gif_preview()
+    first_table = workspace._gif_frame_ends
+    workspace._advance_gif_preview()
+    assert workspace._gif_frame_ends is first_table
+    assert workspace._gif_frame_ends == [40, 100, 180, 280]
+    workspace._stop_gif_preview()
+    workspace.finalize_close()
+    workspace.close()
+
+
+def test_close_finalizes_workspace_even_when_never_shown():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (12, 10), "red"))
+    workspace._effect_preview_timer.start()
+
+    assert workspace.close()
+
+    assert workspace._finalized
+    assert not workspace._effect_preview_timer.isActive()
+    assert not workspace.documents
+    assert workspace.canvas.document is None

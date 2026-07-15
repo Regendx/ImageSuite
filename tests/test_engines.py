@@ -2,7 +2,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageChops
 
 from imagesuite.editor import effects
 from imagesuite.models import RectMask
@@ -364,6 +365,42 @@ def test_compose_transforms_applies_censor_chain_in_order():
     ])
     result = chain(image)
     assert result.getpixel((5, 5))[:3] == (255, 255, 255)
+
+
+def test_compose_transforms_releases_intermediates_but_not_caller():
+    source = Image.new("RGBA", (10, 10), "red")
+    intermediates: list[Image.Image] = []
+
+    def first(_image: Image.Image) -> Image.Image:
+        result = Image.new("RGBA", (10, 10), "green")
+        intermediates.append(result)
+        return result
+
+    chain = effects.compose_transforms([first, lambda image: effects.fill_color(image, (0, 0, 255, 255))])
+    result = chain(source)
+
+    assert source.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert result.getpixel((0, 0))[:3] == (0, 0, 255)
+    with pytest.raises(ValueError):
+        intermediates[0].getpixel((0, 0))
+    result.close()
+    source.close()
+
+
+def test_targeted_effect_does_not_close_source_or_temporary_masks():
+    source = Image.new("RGB", (20, 20), "white")
+    result = effects.apply_to_target(
+        source,
+        lambda image: effects.fill_color(image, (0, 0, 0, 255)),
+        RectMask(4, 4, 12, 12),
+        [],
+        feather=3,
+        padding=2,
+    )
+    assert source.getpixel((0, 0)) == (255, 255, 255)
+    assert result.mode == "RGBA"
+    result.close()
+    source.close()
 
 
 def test_curated_censor_effects_preserve_size_mode_and_alpha():
@@ -733,6 +770,57 @@ def test_worker_plan_uses_measured_photo_caps(monkeypatch):
     assert upscale_engine.plan_worker_count(["a.jpg"] * 50, png, available_bytes=32 * 1024**3, cpu_count=16).effective == 4
 
 
+def test_ascii_preserves_hues_with_equal_luminance():
+    source = Image.new("RGBA", (160, 80), (255, 0, 0, 255))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(source)
+    # Pillow maps both colors to approximately the same grayscale value, so a
+    # luminance-only implementation cannot distinguish the boundary.
+    draw.rectangle((80, 0, 159, 79), fill=(0, 130, 0, 255))
+
+    result = effects.ascii_art_tuned(source, 100, 8, 0, 60, 72, 0)
+    pixels = np.asarray(result.convert("RGB"), dtype=np.float32)
+    left = pixels[:, 8:72].mean(axis=(0, 1))
+    right = pixels[:, 88:152].mean(axis=(0, 1))
+
+    assert left[0] - left[1] > 35
+    assert right[1] - right[0] > 20
+    assert np.linalg.norm(left - right) > 45
+
+
+def test_ascii_contours_detect_equal_luminance_color_boundary():
+    source = Image.new("RGBA", (160, 80), (255, 0, 0, 255))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((80, 0, 159, 79), fill=(0, 130, 0, 255))
+
+    plain = effects.ascii_art_tuned(source, 100, 8, 0, 60, 72, 0)
+    contoured = effects.ascii_art_tuned(source, 100, 8, 0, 60, 72, 100)
+    difference = np.asarray(ImageChops.difference(plain, contoured).convert("RGB"))
+
+    assert difference.max() > 0
+    assert np.count_nonzero(difference[:, 68:92]) > 0
+
+
+def test_ascii_tone_polarity_can_invert_dense_character_preference():
+    gradient = np.tile(np.linspace(0, 255, 128, dtype=np.uint8), (64, 1))
+    alpha = np.full_like(gradient, 255)
+    source = Image.fromarray(np.dstack((gradient, gradient, gradient, alpha)), "RGBA")
+    dark_dense = effects.ascii_art_tuned(source, 100, 8, 58, 62, 72, 0, 0)
+    light_dense = effects.ascii_art_tuned(source, 100, 8, 58, 62, 72, 0, 100)
+
+    dark_pixels = np.asarray(dark_dense.convert("L"), dtype=np.float32)
+    light_pixels = np.asarray(light_dense.convert("L"), dtype=np.float32)
+    left_dark = dark_pixels[:, : dark_pixels.shape[1] // 3].mean()
+    right_dark = dark_pixels[:, -dark_pixels.shape[1] // 3 :].mean()
+    left_light = light_pixels[:, : light_pixels.shape[1] // 3].mean()
+    right_light = light_pixels[:, -light_pixels.shape[1] // 3 :].mean()
+
+    assert left_dark != right_dark
+    assert left_light != right_light
+    assert (left_dark - right_dark) * (left_light - right_light) < 0
+
+
 def test_ascii_contour_strength_adds_edge_oriented_structure():
     source = Image.new("RGBA", (160, 100), "white")
     from PIL import ImageDraw
@@ -848,3 +936,98 @@ def test_animation_reduction_scales_selection_geometry(tmp_path: Path):
     assert document.face_masks[0] == RectMask(round(10 * sx), round(20 * sy), round(50 * sx), round(60 * sy))
     assert document.lasso_points[0] == (round(10 * sx), round(10 * sy))
     document.close()
+
+
+def test_ascii_rasterizes_each_glyph_once_and_reuses_cached_masks(monkeypatch):
+    from PIL import ImageDraw
+
+    effects._ascii_glyph_masks.cache_clear()
+    effects._ascii_palette_data.cache_clear()
+    effects._ascii_font.cache_clear()
+    source = Image.new("RGBA", (320, 180), (210, 35, 45, 255))
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((160, 0, 319, 179), fill=(20, 145, 70, 255))
+
+    calls = 0
+    original_text = ImageDraw.ImageDraw.text
+
+    def counted_text(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", counted_text)
+    first = effects.ascii_art_tuned(source, 100, 8, 60, 72, 72, 84)
+    first_pass_calls = calls
+    second = effects.ascii_art_tuned(source, 100, 8, 60, 72, 72, 84)
+
+    assert first_pass_calls <= len(effects._ASCII_PRINTABLE)
+    assert calls == first_pass_calls
+    assert first.tobytes() == second.tobytes()
+    assert effects._ascii_glyph_masks.cache_info().hits >= 1
+
+
+def test_ascii_palette_is_font_calibrated_and_spans_full_tonal_range():
+    effects._ascii_glyph_masks.cache_clear()
+    effects._ascii_palette_data.cache_clear()
+    low_palette, low_lut = effects._ascii_palette_data(10, 0)
+    rich_palette, rich_lut = effects._ascii_palette_data(10, 100)
+    masks = effects._ascii_glyph_masks(10, effects._ASCII_PRINTABLE)
+    coverage = masks.reshape(len(effects._ASCII_PRINTABLE), -1).mean(axis=1)
+    rich_coverage = np.array([
+        coverage[effects._ASCII_PRINTABLE.index(char)] for char in rich_palette
+    ])
+    low_coverage = np.array([
+        coverage[effects._ASCII_PRINTABLE.index(char)] for char in low_palette
+    ])
+
+    assert len(low_palette) == 6
+    assert len(rich_palette) == len(effects._ASCII_PRINTABLE)
+    assert np.all(np.diff(rich_coverage) >= 0)
+    assert low_coverage[0] == coverage.min()
+    assert low_coverage[-1] == coverage.max()
+    assert low_lut[0] != low_lut[255]
+    assert len(set(rich_lut.tolist())) >= 70
+
+
+def test_ascii_color_slider_controls_quantization_precision():
+    colors = np.array(
+        [[[17, 34, 51], [18, 35, 52], [129, 142, 155]]],
+        dtype=np.float32,
+    )
+    reduced = effects._ascii_quantize_colors(colors, 0)
+    medium = effects._ascii_quantize_colors(colors, 50)
+    full = effects._ascii_quantize_colors(colors, 100)
+
+    assert np.array_equal(full, colors)
+    assert len(np.unique(reduced.reshape(-1, 3), axis=0)) <= len(np.unique(medium.reshape(-1, 3), axis=0))
+    assert not np.array_equal(reduced, full)
+
+
+def test_upscale_video_export_forwards_source_audio(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    frames = [Image.new("RGBA", (12, 10), color) for color in ("red", "green")]
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        upscale_engine,
+        "read_animated_media",
+        lambda _source: ([frame.copy() for frame in frames], [100, 100], 0, "mp4", False),
+    )
+
+    def fake_save(rendered, durations, target, **kwargs):
+        captured.update(kwargs)
+        Path(target).write_bytes(b"output")
+
+    monkeypatch.setattr(upscale_engine, "save_animation", fake_save)
+    output = process_file(
+        source,
+        tmp_path / "out",
+        UpscaleSettings(method="Nearest", scale_factor=1, output_format="MP4", preserve_audio=True),
+    )
+    assert output is not None and output.exists()
+    assert captured["audio_source"] == source
+    assert captured["audio_duration_ms"] == 200
+    for frame in frames:
+        frame.close()

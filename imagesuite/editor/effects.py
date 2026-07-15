@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable, Iterable
+from functools import lru_cache
 import math
 import colorsys
 
@@ -15,9 +16,18 @@ def _rgba(image: Image.Image) -> Image.Image:
 
 
 def _with_original_alpha(source: Image.Image, result: Image.Image) -> Image.Image:
-    rgba = result.convert("RGBA")
-    rgba.putalpha(_rgba(source).getchannel("A"))
-    return rgba
+    """Apply source alpha while consuming both temporary input images."""
+    output = result if result.mode == "RGBA" else result.convert("RGBA")
+    if output is not result:
+        result.close()
+    alpha = source.getchannel("A") if "A" in source.getbands() else Image.new("L", source.size, 255)
+    try:
+        output.putalpha(alpha)
+    finally:
+        alpha.close()
+        if source is not output:
+            source.close()
+    return output
 
 
 def _seed(width: int, height: int, *values: int) -> int:
@@ -50,7 +60,11 @@ def pixelate(image: Image.Image, block: int) -> Image.Image:
         (max(1, math.ceil(rgba.width / block)), max(1, math.ceil(rgba.height / block))),
         Image.Resampling.BOX,
     )
-    return _with_original_alpha(rgba, small.resize(rgba.size, Image.Resampling.NEAREST))
+    try:
+        result = small.resize(rgba.size, Image.Resampling.NEAREST)
+    finally:
+        small.close()
+    return _with_original_alpha(rgba, result)
 
 
 def mosaic(image: Image.Image, tile: int) -> Image.Image:
@@ -280,6 +294,7 @@ def thermal_map(image: Image.Image, strength: int = 70) -> Image.Image:
     return _with_original_alpha(rgba, Image.fromarray(rgb, "RGB"))
 
 
+@lru_cache(maxsize=24)
 def _ascii_font(cell: int) -> ImageFont.ImageFont:
     size = max(6, round(cell * 0.95))
     try:
@@ -287,6 +302,88 @@ def _ascii_font(cell: int) -> ImageFont.ImageFont:
     except OSError:
         return ImageFont.load_default()
 
+
+_ASCII_PRINTABLE = "".join(chr(code) for code in range(32, 127))
+_ASCII_CONTOURS = "|-/\\"
+
+
+@lru_cache(maxsize=48)
+def _ascii_glyph_masks(cell: int, characters: str) -> np.ndarray:
+    """Return centered monochrome glyph tiles for one ASCII cell size.
+
+    Rendering every glyph through FreeType for every animation frame dominated
+    ASCII processing time.  The shapes depend only on the cell size and
+    character set, so cache them once and recolor/composite them in bulk.
+    """
+    font = _ascii_font(cell)
+    masks: list[np.ndarray] = []
+    for char in characters:
+        tile = Image.new("L", (cell, cell), 0)
+        draw = ImageDraw.Draw(tile)
+        bbox = draw.textbbox((0, 0), char, font=font)
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        position = (
+            (cell - width) / 2 - bbox[0],
+            (cell - height) / 2 - bbox[1],
+        )
+        draw.text(position, char, fill=255, font=font)
+        masks.append(np.asarray(tile, dtype=np.uint8).copy())
+        tile.close()
+    result = np.stack(masks, axis=0)
+    result.setflags(write=False)
+    return result
+
+
+@lru_cache(maxsize=256)
+def _ascii_palette_data(cell: int, density: int) -> tuple[str, np.ndarray]:
+    """Return a font-calibrated character ramp and 8-bit luminance LUT.
+
+    Fixed ramps are only approximate for a particular font. Measure every
+    printable ASCII glyph at the active cell size, sort by actual ink coverage,
+    then sample the complete light-to-dark span. This keeps low-density ramps
+    simple without losing solid shadows and lets high density expose much finer
+    tonal steps.
+    """
+    density = max(0, min(100, int(density)))
+    masks = _ascii_glyph_masks(cell, _ASCII_PRINTABLE)
+    coverage = masks.reshape(len(_ASCII_PRINTABLE), -1).mean(axis=1, dtype=np.float64)
+    ordered = np.argsort(coverage, kind="stable")
+
+    max_levels = len(ordered)
+    levels = max(6, min(max_levels, 6 + round((max_levels - 6) * density / 100)))
+    if levels >= max_levels:
+        selected = ordered
+    else:
+        ordered_coverage = coverage[ordered]
+        target_coverage = np.linspace(ordered_coverage[0], ordered_coverage[-1], levels)
+        selected_positions = np.abs(
+            ordered_coverage[:, None] - target_coverage[None, :]
+        ).argmin(axis=0)
+        selected_positions = np.unique(selected_positions)
+        selected = ordered[selected_positions]
+    selected_coverage = coverage[selected]
+
+    minimum = float(selected_coverage[0])
+    span = max(1e-6, float(selected_coverage[-1]) - minimum)
+    darkness = np.clip((selected_coverage - minimum) * (255.0 / span), 0.0, 255.0)
+    targets = np.arange(256, dtype=np.float64)
+    nearest = np.abs(targets[:, None] - darkness[None, :]).argmin(axis=1)
+    glyph_lut = selected[nearest].astype(np.intp, copy=False)
+    glyph_lut.setflags(write=False)
+    palette = "".join(_ASCII_PRINTABLE[index] for index in selected)
+    return palette, glyph_lut
+
+
+def _ascii_quantize_colors(colors: np.ndarray, preservation: int) -> np.ndarray:
+    """Use the color slider to control RGB precision and temporal stability."""
+    preservation = max(0, min(100, int(preservation)))
+    channel_bits = min(8, 4 + preservation // 25)
+    values = colors.astype(np.float32, copy=False)
+    if channel_bits >= 8:
+        return values
+    levels = (1 << channel_bits) - 1
+    return np.rint(values * (levels / 255.0)) * (255.0 / levels)
 
 def _ascii_contour_char(gx: float, gy: float) -> str:
     ax, ay = abs(gx), abs(gy)
@@ -297,46 +394,8 @@ def _ascii_contour_char(gx: float, gy: float) -> str:
     return "/" if gx * gy >= 0 else "\\"
 
 
-def ascii_art_tuned(
-    image: Image.Image,
-    amount: int = 100,
-    cell: int = 10,
-    contrast: int = 60,
-    density: int = 60,
-    color_amount: int = 25,
-    contour_strength: int = 72,
-) -> Image.Image:
-    """Render readable ASCII with luminance glyphs and edge-oriented contours."""
-    rgba = _rgba(image)
-    amount = max(0, min(100, int(amount)))
-    cell = max(5, int(cell))
-    contrast = max(0, min(100, int(contrast)))
-    density = max(0, min(100, int(density)))
-    color_amount = max(0, min(100, int(color_amount)))
-    contour_strength = max(0, min(100, int(contour_strength)))
-
-    # Keep pathological 4K/8K + tiny-cell jobs responsive without altering
-    # ordinary settings. The chosen cell only grows when the user requests
-    # hundreds of thousands of individually rendered glyphs.
-    max_glyphs = 220_000
-    requested_glyphs = math.ceil(rgba.width / cell) * math.ceil(rgba.height / cell)
-    if requested_glyphs > max_glyphs:
-        cell = max(cell, math.ceil(math.sqrt((rgba.width * rgba.height) / max_glyphs)))
-
-    charset_full = " .,:;irsXA253hMHGS#9B&@"
-    levels = max(6, min(len(charset_full), 6 + round((len(charset_full) - 6) * density / 100)))
-    charset = charset_full[:levels]
-    cols = max(1, math.ceil(rgba.width / cell))
-    rows = max(1, math.ceil(rgba.height / cell))
-
-    gray = ImageOps.grayscale(rgba)
-    gray = ImageEnhance.Contrast(gray).enhance(0.75 + contrast / 45)
-    gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray_small = gray.resize((cols, rows), Image.Resampling.BOX)
-    color_small = rgba.convert("RGB").resize((cols, rows), Image.Resampling.BOX)
-    lum = np.asarray(gray_small, dtype=np.float32)
-
-    padded = np.pad(lum, 1, mode="edge")
+def _ascii_sobel(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    padded = np.pad(values.astype(np.float32, copy=False), 1, mode="edge")
     gx = (
         -padded[:-2, :-2] + padded[:-2, 2:]
         - 2 * padded[1:-1, :-2] + 2 * padded[1:-1, 2:]
@@ -346,50 +405,171 @@ def ascii_art_tuned(
         -padded[:-2, :-2] - 2 * padded[:-2, 1:-1] - padded[:-2, 2:]
         + padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]
     )
+    return gx, gy
+
+
+def _ascii_edge_score(gx: np.ndarray, gy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     magnitude = np.hypot(gx, gy)
-    edge_scale = float(np.percentile(magnitude, 92)) if magnitude.size else 1.0
-    if edge_scale <= 0:
-        edge_scale = 1.0
-    edge_score = np.clip(magnitude / edge_scale, 0.0, 1.0)
+    scale = float(np.percentile(magnitude, 92)) if magnitude.size else 1.0
+    if scale <= 0:
+        scale = 1.0
+    relative = np.clip(magnitude / scale, 0.0, 1.0)
+    # A percentile score alone classifies a smooth full-frame gradient as an
+    # edge everywhere. Keep gradual tonal/color transitions in the glyph ramp
+    # and reserve contour characters for sufficiently abrupt changes.
+    absolute = np.clip((magnitude - 180.0) / 580.0, 0.0, 1.0)
+    return relative * absolute, magnitude
+
+
+def ascii_art_tuned(
+    image: Image.Image,
+    amount: int = 100,
+    cell: int = 10,
+    contrast: int = 60,
+    density: int = 60,
+    color_amount: int = 25,
+    contour_strength: int = 72,
+    tone_polarity: int = 0,
+) -> Image.Image:
+    """Render color-aware ASCII with luminance glyphs and chromatic contours."""
+    rgba = _rgba(image)
+    amount = max(0, min(100, int(amount)))
+    cell = max(5, int(cell))
+    contrast = max(0, min(100, int(contrast)))
+    density = max(0, min(100, int(density)))
+    color_amount = max(0, min(100, int(color_amount)))
+    contour_strength = max(0, min(100, int(contour_strength)))
+    tone_polarity = max(0, min(100, int(tone_polarity)))
+
+    # Keep pathological 4K/8K + tiny-cell jobs responsive without altering
+    # ordinary settings. The chosen cell only grows when the user requests
+    # hundreds of thousands of individually rendered glyphs.
+    max_glyphs = 220_000
+    requested_glyphs = math.ceil(rgba.width / cell) * math.ceil(rgba.height / cell)
+    if requested_glyphs > max_glyphs:
+        cell = max(cell, math.ceil(math.sqrt((rgba.width * rgba.height) / max_glyphs)))
+
+    charset, glyph_lut = _ascii_palette_data(cell, density)
+    cols = max(1, math.ceil(rgba.width / cell))
+    rows = max(1, math.ceil(rgba.height / cell))
+
+    gray = ImageOps.grayscale(rgba)
+    gray = ImageEnhance.Contrast(gray).enhance(0.75 + contrast / 45)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray_small = gray.resize((cols, rows), Image.Resampling.BOX)
+
+    rgb = rgba.convert("RGB")
+    averaged_color_small = rgb.resize((cols, rows), Image.Resampling.BOX)
+    centered_color_small = rgb.resize((cols, rows), Image.Resampling.NEAREST)
+    averaged_colors = np.asarray(averaged_color_small, dtype=np.float32)
+    centered_colors = np.asarray(centered_color_small, dtype=np.float32)
+
+    # BOX averaging is stable for backgrounds but can turn two adjacent hues
+    # into a muddy intermediate color. Bias glyph ink toward the cell center,
+    # increasingly so when the user asks for stronger color preservation.
+    center_weight = 0.42 + 0.43 * (color_amount / 100)
+    colors = averaged_colors * (1.0 - center_weight) + centered_colors * center_weight
+    colors = _ascii_quantize_colors(colors, color_amount)
+    background_colors = _ascii_quantize_colors(averaged_colors, color_amount)
+    lum = np.asarray(gray_small, dtype=np.float32)
+
+    # Luminance-only contours miss boundaries between colors with similar
+    # brightness. Add two opponent-color channels and choose the strongest
+    # local gradient for both edge strength and contour orientation.
+    luma_gx, luma_gy = _ascii_sobel(lum)
+    luma_score, luma_magnitude = _ascii_edge_score(luma_gx, luma_gy)
+    red_green = averaged_colors[:, :, 0] - averaged_colors[:, :, 1]
+    yellow_blue = (averaged_colors[:, :, 0] + averaged_colors[:, :, 1]) * 0.5 - averaged_colors[:, :, 2]
+    rg_gx, rg_gy = _ascii_sobel(red_green)
+    yb_gx, yb_gy = _ascii_sobel(yellow_blue)
+    rg_score, rg_magnitude = _ascii_edge_score(rg_gx, rg_gy)
+    yb_score, yb_magnitude = _ascii_edge_score(yb_gx, yb_gy)
+
+    chroma_weight = 0.58 + 0.42 * (color_amount / 100)
+    edge_score = np.maximum(luma_score, np.maximum(rg_score, yb_score) * chroma_weight)
+    contour_gx = luma_gx.copy()
+    contour_gy = luma_gy.copy()
+    strongest_magnitude = luma_magnitude.copy()
+    use_rg = rg_magnitude > strongest_magnitude
+    contour_gx[use_rg] = rg_gx[use_rg]
+    contour_gy[use_rg] = rg_gy[use_rg]
+    strongest_magnitude[use_rg] = rg_magnitude[use_rg]
+    use_yb = yb_magnitude > strongest_magnitude
+    contour_gx[use_yb] = yb_gx[use_yb]
+    contour_gy[use_yb] = yb_gy[use_yb]
+
     contour_threshold = 1.01 if contour_strength <= 0 else 0.92 - (contour_strength / 100) * 0.72
 
-    # A faint source-aware background makes the result less like disconnected
-    # character stickers while retaining the dark terminal-art appearance.
-    source_blocks = color_small.resize(rgba.size, Image.Resampling.BILINEAR)
-    source_blocks = ImageEnhance.Brightness(source_blocks).enhance(0.20)
-    background_mix = 0.08 + 0.30 * (color_amount / 100)
+    # Keep the terminal-like dark base while retaining enough block color to
+    # separate neighboring hues instead of reducing them to the same gray.
+    quantized_background = Image.fromarray(np.clip(background_colors, 0, 255).astype(np.uint8), "RGB")
+    source_blocks = quantized_background.resize(rgba.size, Image.Resampling.BILINEAR)
+    quantized_background.close()
+    grayscale_blocks = ImageOps.grayscale(source_blocks).convert("RGB")
+    color_strength = color_amount / 100
+    source_blocks = Image.blend(grayscale_blocks, source_blocks, color_strength)
+    source_blocks = ImageEnhance.Color(source_blocks).enhance(1.0 + 0.55 * color_strength)
+    source_blocks = ImageEnhance.Brightness(source_blocks).enhance(0.24 + 0.12 * color_strength)
+    background_mix = 0.15 + 0.42 * color_strength
     canvas = Image.blend(Image.new("RGB", rgba.size, (10, 11, 14)), source_blocks, background_mix)
-    draw = ImageDraw.Draw(canvas)
-    font = _ascii_font(cell)
-    colors = np.asarray(color_small, dtype=np.uint8)
+    # Preserve hue independently of glyph brightness. Linear interpolation
+    # with gray suppressed color differences too aggressively, especially at
+    # the former default of 30 percent.
+    sample_luma = (
+        colors[:, :, 0] * 0.2126
+        + colors[:, :, 1] * 0.7152
+        + colors[:, :, 2] * 0.0722
+    )
+    chroma = colors - sample_luma[:, :, None]
+    chroma_gain = 1.25 * color_strength
 
-    for y in range(rows):
-        top = y * cell
-        for x in range(cols):
-            left = x * cell
-            value = int(lum[y, x])
-            if edge_score[y, x] >= contour_threshold:
-                char = _ascii_contour_char(float(gx[y, x]), float(gy[y, x]))
-                mono = 242
-            else:
-                index = round((255 - value) * (levels - 1) / 255)
-                char = charset[index]
-                if char == " ":
-                    continue
-                mono = max(72, min(245, round(238 - value * 0.56)))
-            sampled = colors[y, x]
-            ink = tuple(
-                int((mono * (100 - color_amount) + int(sampled[channel]) * color_amount) / 100)
-                for channel in range(3)
-            )
-            bbox = draw.textbbox((0, 0), char, font=font)
-            width = bbox[2] - bbox[0]
-            height = bbox[3] - bbox[1]
-            position = (
-                left + (cell - width) / 2 - bbox[0],
-                top + (cell - height) / 2 - bbox[1],
-            )
-            draw.text(position, char, fill=ink, font=font)
+    # Build the full glyph layer in NumPy instead of invoking FreeType once per
+    # cell.  This matters especially for video, where the same font and cell
+    # geometry are reused hundreds or thousands of times.
+    #
+    # Tone polarity slides the glyph-density preference between the classic
+    # "darker areas use denser characters" mapping and the inverse
+    # "lighter areas use denser characters" mapping.  The midpoint keeps useful
+    # contrast by emphasizing both highlight and shadow extremes instead of
+    # collapsing to one flat density.
+    lum_norm = lum / 255.0
+    dark_dense = 1.0 - lum_norm
+    light_dense = lum_norm
+    extremes_dense = np.clip(np.abs(lum_norm - 0.5) * 2.0, 0.0, 1.0)
+    if tone_polarity <= 50:
+        blend = tone_polarity / 50.0
+        density_map = dark_dense * (1.0 - blend) + extremes_dense * blend
+    else:
+        blend = (tone_polarity - 50) / 50.0
+        density_map = extremes_dense * (1.0 - blend) + light_dense * blend
+    target_darkness = np.clip(np.rint(density_map * 255.0), 0, 255).astype(np.uint8)
+    glyph_indices = glyph_lut[target_darkness].copy()
+    contour_cells = edge_score >= contour_threshold
+    if np.any(contour_cells):
+        ax = np.abs(contour_gx)
+        ay = np.abs(contour_gy)
+        contour_indices = np.full((rows, cols), _ASCII_PRINTABLE.index("\\"), dtype=np.intp)
+        contour_indices[contour_gx * contour_gy >= 0] = _ASCII_PRINTABLE.index("/")
+        contour_indices[ay > ax * 1.8] = _ASCII_PRINTABLE.index("-")
+        contour_indices[ax > ay * 1.8] = _ASCII_PRINTABLE.index("|")
+        glyph_indices[contour_cells] = contour_indices[contour_cells]
+
+    mono = np.clip(np.rint(238.0 - lum * 0.56), 72.0, 245.0)
+    mono[contour_cells] = 242.0
+    ink_colors = np.clip(mono[:, :, None] + chroma * chroma_gain, 0, 255).astype(np.uint8)
+
+    glyph_tiles = _ascii_glyph_masks(cell, _ASCII_PRINTABLE)[glyph_indices]
+    glyph_mask_array = glyph_tiles.transpose(0, 2, 1, 3).reshape(rows * cell, cols * cell)
+    glyph_mask = Image.fromarray(glyph_mask_array, "L")
+    ink_blocks = Image.fromarray(ink_colors, "RGB").resize(
+        (cols * cell, rows * cell), Image.Resampling.NEAREST
+    )
+    if glyph_mask.size != rgba.size:
+        glyph_mask = glyph_mask.crop((0, 0, rgba.width, rgba.height))
+        ink_blocks = ink_blocks.crop((0, 0, rgba.width, rgba.height))
+    canvas.paste(ink_blocks, (0, 0), glyph_mask)
+    glyph_mask.close()
+    ink_blocks.close()
 
     out = canvas.convert("RGBA")
     return mix_effect(rgba, out, amount)
@@ -494,11 +674,55 @@ def compose_transforms(transforms: Iterable[Callable[[Image.Image], Image.Image]
 
     def apply(image: Image.Image) -> Image.Image:
         result = image
-        for transform in chain:
-            result = transform(result)
-        return result
+        owns_result = False
+        try:
+            for transform in chain:
+                transformed = transform(result)
+                if transformed is None:
+                    raise ValueError("An effect transform returned no image.")
+                if transformed is result:
+                    continue
+                if owns_result:
+                    result.close()
+                result = transformed
+                owns_result = True
+            return result if owns_result else image.copy()
+        except Exception:
+            if owns_result:
+                result.close()
+            raise
 
     return apply
+
+
+def _transformed_rgba_copy(
+    image: Image.Image,
+    transform: Callable[[Image.Image], Image.Image],
+) -> Image.Image:
+    """Run a transform without transferring ownership of the caller's image."""
+    source = image.copy()
+    result: Image.Image | None = None
+    try:
+        result = transform(source)
+        if result is None:
+            raise ValueError("An effect transform returned no image.")
+        if result is source:
+            if source.mode == "RGBA":
+                return source
+            converted = source.convert("RGBA")
+            source.close()
+            return converted
+        source.close()
+        if result.mode == "RGBA":
+            return result
+        converted = result.convert("RGBA")
+        result.close()
+        return converted
+    except Exception:
+        if result is not None and result is not source:
+            result.close()
+        source.close()
+        raise
 
 def _soft_mask(mask: Image.Image, feather: int) -> Image.Image:
     feather = max(0, int(feather))
@@ -507,7 +731,10 @@ def _soft_mask(mask: Image.Image, feather: int) -> Image.Image:
     softened = mask.filter(ImageFilter.GaussianBlur(max(0.5, feather / 2.5)))
     # Gaussian blur has a tiny infinite tail. Clamp imperceptible values so
     # pixels well outside the transition remain byte-for-byte unchanged.
-    return softened.point(lambda value: 0 if value <= 8 else 255 if value >= 247 else value)
+    try:
+        return softened.point(lambda value: 0 if value <= 8 else 255 if value >= 247 else value)
+    finally:
+        softened.close()
 
 
 def _expand_mask(mask: Image.Image, padding: int) -> Image.Image:
@@ -520,7 +747,10 @@ def _expand_mask(mask: Image.Image, padding: int) -> Image.Image:
     # thresholded Gaussian gives a fast, stable approximation for wide lasso
     # expansion while the feather pass below still produces the final edge.
     expanded = mask.filter(ImageFilter.GaussianBlur(max(0.5, padding / 2.2)))
-    return expanded.point(lambda value: 255 if value >= 4 else 0)
+    try:
+        return expanded.point(lambda value: 255 if value >= 4 else 0)
+    finally:
+        expanded.close()
 
 
 def target_mask(
@@ -535,8 +765,14 @@ def target_mask(
     if lasso:
         if len(lasso) >= 3:
             draw.polygon(lasso, fill=255)
-            mask = _expand_mask(mask, padding)
-        return _soft_mask(mask, feather)
+            expanded = _expand_mask(mask, padding)
+            if expanded is not mask:
+                mask.close()
+                mask = expanded
+        softened = _soft_mask(mask, feather)
+        if softened is not mask:
+            mask.close()
+        return softened
     if selection is not None:
         if selection.width > 0 and selection.height > 0:
             left = max(0, selection.left - padding)
@@ -544,7 +780,11 @@ def target_mask(
             right = min(size[0], selection.right + padding)
             bottom = min(size[1], selection.bottom + padding)
             draw.rectangle((left, top, right, bottom), fill=255)
-        return _soft_mask(mask, feather)
+        softened = _soft_mask(mask, feather)
+        if softened is not mask:
+            mask.close()
+        return softened
+    mask.close()
     return Image.new("L", size, 255)
 
 
@@ -564,8 +804,14 @@ def focus_mask(
             min(size[1], face.bottom + padding),
         )
         draw.ellipse(box, fill=255)
-    protected = _soft_mask(protected, feather)
-    return ImageOps.invert(protected)
+    softened = _soft_mask(protected, feather)
+    if softened is not protected:
+        protected.close()
+        protected = softened
+    try:
+        return ImageOps.invert(protected)
+    finally:
+        protected.close()
 
 
 def apply_to_target(
@@ -576,11 +822,19 @@ def apply_to_target(
     feather: int = 0,
     padding: int = 0,
 ) -> Image.Image:
-    processed = transform(image.copy()).convert("RGBA")
-    if processed.size != image.size:
-        processed = processed.resize(image.size, Image.Resampling.LANCZOS)
+    processed = _transformed_rgba_copy(image, transform)
+    base = image.copy() if image.mode == "RGBA" else image.convert("RGBA")
     mask = target_mask(image.size, selection, lasso, feather=feather, padding=padding)
-    return Image.composite(processed, image.convert("RGBA"), mask)
+    try:
+        if processed.size != image.size:
+            resized = processed.resize(image.size, Image.Resampling.LANCZOS)
+            processed.close()
+            processed = resized
+        return Image.composite(processed, base, mask)
+    finally:
+        processed.close()
+        base.close()
+        mask.close()
 
 
 def apply_outside_faces(
@@ -590,9 +844,19 @@ def apply_outside_faces(
     feather: int = 0,
     padding: int = 0,
 ) -> Image.Image:
-    processed = transform(image.copy()).convert("RGBA")
+    processed = _transformed_rgba_copy(image, transform)
+    base = image.copy() if image.mode == "RGBA" else image.convert("RGBA")
     mask = focus_mask(image.size, faces, feather=feather, padding=padding)
-    return Image.composite(processed, image.convert("RGBA"), mask)
+    try:
+        if processed.size != image.size:
+            resized = processed.resize(image.size, Image.Resampling.LANCZOS)
+            processed.close()
+            processed = resized
+        return Image.composite(processed, base, mask)
+    finally:
+        processed.close()
+        base.close()
+        mask.close()
 
 def adjustments(image: Image.Image, brightness: int = 0, contrast: int = 0, saturation: int = 0, sharpness: int = 0) -> Image.Image:
     result = image.convert("RGBA")
@@ -676,15 +940,26 @@ def rotate_keep(image: Image.Image, degrees: float) -> Image.Image:
 # above remain as small compatibility building blocks for saved presets/tests.
 
 def mix_effect(source: Image.Image, processed: Image.Image, amount: int) -> Image.Image:
-    rgba = _rgba(source)
+    """Blend two owned effect temporaries and release superseded buffers."""
+    rgba = source if source.mode == "RGBA" else source.convert("RGBA")
+    if rgba is not source:
+        source.close()
     amount = max(0, min(100, int(amount)))
     if amount <= 0:
-        return rgba.copy()
-    result = _rgba(processed)
+        if processed is not rgba:
+            processed.close()
+        return rgba
+    result = processed if processed.mode == "RGBA" else processed.convert("RGBA")
+    if result is not processed:
+        processed.close()
     if result.size != rgba.size:
-        result = result.resize(rgba.size, Image.Resampling.LANCZOS)
+        resized = result.resize(rgba.size, Image.Resampling.LANCZOS)
+        result.close()
+        result = resized
     if amount < 100:
-        result = Image.blend(rgba, result, amount / 100.0)
+        blended = Image.blend(rgba, result, amount / 100.0)
+        result.close()
+        result = blended
     return _with_original_alpha(rgba, result)
 
 

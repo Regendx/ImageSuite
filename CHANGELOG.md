@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.9.0 RC33
+
+Windows installation, Explorer integration, single-instance routing, and safe automatic updates.
+
+- Expanded the per-user Inno Setup installer with Start Menu/Desktop integration and optional dedicated **Open in ImageSuite** image/video shell verbs plus **Open folder in ImageSuite**. These are direct Explorer commands, not Open With registrations or default-file associations.
+- Added single-instance path forwarding so Explorer commands and repeated launches open files in the existing ImageSuite window instead of spawning duplicate editors.
+- Added **Help → Check for updates…**, once-daily optional automatic checks, and stable/release-candidate channel preferences backed by the public `Regendx/ImageSuite` GitHub Releases feed.
+- Added confirmed installer downloads, progress/cancellation, GitHub SHA-256 asset verification when available, a second install confirmation, exit-safe silent installation, cleanup, and automatic relaunch.
+- Added a Windows GitHub Actions release workflow that validates the project, builds the PyInstaller application and Inno Setup installer, uploads the installer artifact, and attaches it to tagged GitHub Releases.
+- Hardened simultaneous-launch handling so a second process never removes an active local-server endpoint.
+- Serialized recovery encoding and made editor shutdown wait for recovery workers, preventing multiple native Pillow recovery encoders from surviving into later editor instances.
+- Added updater version/asset selection, digest verification, installer script, single-instance payload, Explorer registry, release workflow, and preferences regressions; the full suite now contains 217 tests.
+
+## 0.9.0 RC32
+
+ASCII tone-polarity control.
+
+- Added an **ASCII Art → Tone polarity** slider that moves glyph density from the classic dark-areas-dense mapping toward light-areas-dense mapping.
+- The midpoint preserves useful structure by emphasizing both highlight and shadow extremes instead of flattening the character ramp.
+- Existing ASCII presets and saved chains remain compatible; the new control defaults to `0`, which preserves the previous RC31 behavior exactly.
+- Added UI and engine regressions covering the new control and verifying that tone polarity can invert the dense-character preference.
+
+## 0.9.0 RC31
+
+Reliability, audio preservation, lifecycle, and video-I/O audit.
+
+- Decoupled source-audio preservation from direct source-video export. Edited MP4/WebM documents can now render their changed frames and remux the matching original audio segment instead of disabling the audio option after the first edit.
+- Added an enabled **Preserve source audio when available** option to editor video export whenever the imported MP4/WebM source still exists, and added the equivalent **Preserve source video audio** option to Enhance/Batch video output.
+- Kept direct unedited source export as the fastest full-resolution path, while making rendered edited export and audio remux a separate, explicit path.
+- Replaced the ImageIO video wrapper with direct bundled-FFmpeg probing, bounded proxy decoding, thumbnail reading, and raw-frame video encoding. This removes leaked FFmpeg pipe handles observed under Python 3.13, improves cancellation/error ownership, and removes the redundant ImageIO runtime dependency.
+- Fixed active-tab close ordering so the canvas is detached before Pillow buffers are released, preventing stale-document access when closing an image and editing another.
+- Closing a background tab no longer restarts the active document or cancels its current preview/playback state.
+- Made `EditorWorkspace.close()` finalize timers, documents, caches, and recovery workers even when Qt never emits a close event for a hidden or embedded workspace.
+- Recovery workers now receive owned still/frame snapshots, preventing a background recovery write from reading frames that have already been replaced or closed.
+- Added explicit decoder ownership so imported/clipboard/recovery images are released after the document copies them, without unexpectedly closing images retained by public callers.
+- Cached cumulative animation timing tables instead of rebuilding them for every playback frame and scrubber update.
+- Fixed effect-chain, target-mask, alpha-layer, and blend ownership so superseded Pillow images are released immediately during long image/video operations.
+- Removed unused imports and locals, expanded stale transfer cleanup to MP4/WebM files, and kept the compatibility seams that are still actively exercised.
+- Added edited-video audio remux, optional audio removal, Enhance audio forwarding, repeated close/edit, background-preview preservation, hidden-workspace shutdown, recovery ownership, timing-cache reuse, transform-intermediate cleanup, and dependency regressions. The full suite now contains 207 tests.
+- Passed the complete suite with `ResourceWarning` and unraisable exceptions promoted to errors, plus Ruff undefined-name/syntax checks, Vulture high-confidence dead-code checks, release validation, dependency validation, and a 50-cycle open/close/edit stress run with no file-descriptor growth.
+
+## 0.9.0 RC30
+
+ASCILINE-inspired ASCII tonal fidelity and color stability.
+
+- Replaced the fixed 24-character ramp with a font-calibrated ramp built from all 95 printable ASCII characters. ImageSuite measures actual glyph ink coverage at each cell size instead of assuming one hard-coded ordering fits every font size.
+- Added a cached 256-value luminance lookup table so character selection remains vectorized and video performance stays at RC29 levels.
+- Changed **Charset density** to sample the complete light-to-dark range. Low density now uses fewer characters without losing solid shadows; high density exposes up to 95 calibrated glyphs for finer gradients and facial detail.
+- Kept luminance-based character selection independent from source RGB sampling, preserving the existing **Color preservation** slider.
+- Added slider-driven RGB precision: lower values use a compact stable palette, the default uses 6-bit-per-channel color, and 100% retains full 8-bit RGB. This reduces minor frame-to-frame color churn without forcing monochrome output.
+- Retained RC29's cached glyph masks, vectorized composition, center-biased color sampling, and chromatic contour detection.
+- Added calibrated-ramp span, rich-palette usage, quantization precision, cache reuse, and performance regressions; the full suite now contains 194 tests.
+
+## 0.9.0 RC29
+
+Fast color-aware ASCII rendering for animation.
+
+- Replaced the per-cell FreeType text-render loop with cached monochrome glyph tiles and vectorized NumPy composition.
+- Glyph shapes are now rasterized once per cell size and character set, then reused across every frame of a GIF, MP4, or WebM edit.
+- Kept RC28's hue-preserving ink, center-biased color sampling, opponent-color contours, and smooth-gradient edge gate unchanged.
+- Reduced a local synthetic 960×540, 9-pixel-cell frame from roughly 0.48 seconds to roughly 0.05 seconds after warm-up; a 120-frame proxy now processes in seconds rather than close to a minute on the same environment.
+- Added a regression that counts font-render calls and verifies a second frame reuses the cached glyph masks; the full suite now contains 192 tests.
+
+## 0.9.0 RC28
+
+Color-aware ASCII rendering.
+
+- Reworked ASCII Art so hue is preserved independently of glyph brightness instead of being heavily blended toward gray.
+- Added opponent-color edge detection, allowing contour glyphs to separate colors with matching luminance that grayscale analysis cannot distinguish.
+- Changed glyph color sampling to favor each cell center while retaining a stable averaged background, reducing muddy intermediate colors along boundaries.
+- Added an absolute edge gate so smooth color gradients remain represented by the character-density ramp instead of turning the entire image into contour characters.
+- Renamed **Color amount** to **Color preservation**, raised its default from 30% to 72%, and updated the ASCII mask preset to use the corrected color path.
+- Added equal-luminance hue preservation, chromatic-boundary contour, default-control, and visible-parameter regressions; the full suite now contains 191 tests.
+
+## 0.9.0 RC27
+
+Video-editor style MP4/WebM trimming and unrestricted source duration.
+
+- Replaced the numeric-only video importer with a resizable preview window containing playback, a playhead, a thumbnail filmstrip, draggable In/Out handles, Set In/Out controls, Select All, and optional precise time fields.
+- Added the same visible timeline and playback workflow to GIF/MP4/WebM Save As, so export ranges no longer have to be entered as start and duration values alone.
+- Removed the pre-emptive five-minute source-duration rejection. Multi-hour selections now automatically choose a sparse, memory-bounded proxy while preserving the complete selected timeline.
+- Filmstrip thumbnails use independent fast FFmpeg seeks on a background worker instead of decoding the source sequentially; closing the dialog cancels remaining thumbnail work.
+- The import window defaults to the full source, clearly separates proxy FPS/resolution from direct-export quality, and estimates retained proxy frames, dimensions, frame rate, and memory.
+- Widened the editor animation scrubber and added elapsed/total time beside the proxy frame number.
+- Removed the separate five-minute ceiling from animation extension; repeat mode remains protected by the existing memory-aware frame limit, while Hold can extend timing without adding frames.
+- Kept direct unedited MP4/WebM export mapped to the original source at full resolution with audio. Edited video still renders directly to video from the bounded proxy and never passes through GIF.
+- Added multi-hour proxy planning, full-source visual selection, filmstrip fast-seek, and timeline synchronization regressions; the full suite now contains 188 tests.
+
+## 0.9.0 RC26
+
+Direct source-video export.
+
+- Added a true FFmpeg source-to-video path for unedited MP4/WebM imports, including clips opened from a selected start time and duration.
+- Direct export reads the original video instead of rebuilding it from the reduced editable preview, preserving original resolution, original frame rate by default, metadata, and audio when present.
+- MP4/WebM export can still choose a timeline subrange, output frame rate, and bitrate; source-relative timing is mapped back to the original file automatically.
+- The video export dialog now clearly distinguishes **Direct FFmpeg export** from **Rendered video export** and states that neither path creates an intermediate GIF.
+- Once pixel edits are applied, direct-source mode is disabled so exports cannot silently discard edits; edited frames continue to encode straight to MP4/WebM.
+- Saving an unchanged source video no longer unnecessarily decodes and re-encodes its editable working frames.
+- Added direct-source provenance, timeline mapping, no-GIF-path, and MP4 workflow regressions; the full suite now contains 186 tests.
+
+## 0.9.0 RC25
+
+Large-video import, exact GIF export timing, and resizable editor tools.
+
+- Added a resizable MP4/WebM import dialog that selects the start time, clip duration, editable frame rate, and maximum image edge before decoding.
+- Video import now seeks directly to the chosen segment and asks FFmpeg to discard unneeded frames before they enter Python memory, allowing multi-gigabyte source files to be handled as bounded editable clips.
+- Added cancellable frame-by-frame import progress and a working-memory estimate before opening a video segment.
+- Animated Save As now opens a resizable export dialog with source start/range selection and an exact exported GIF duration control.
+- GIF playback can be lengthened or shortened without changing the selected frames; timing is distributed exactly in GIF-safe 0.01-second units.
+- Custom-range or retimed exports are written as copies without incorrectly replacing or marking the open source document as saved.
+- Added GIF palette, dithering, optimization, MP4/WebM frame-rate, and bitrate controls to animation export.
+- Replaced the editor's fixed 360-pixel tool column with a draggable splitter that remembers its width, and made the import/export tool dialogs resizable and maximizable.
+- Added streamed seek/trim/downscale, exact-duration GIF round-trip, resizable-dialog, and resizable-sidebar regressions; the full suite now contains 184 tests.
+
+## 0.9.0 RC24
+
+Animation duration extension.
+
+- Added **Extend animation duration…** to the Transform panel for animated GIF, MP4, and WebM documents.
+- Animations can now be extended to an exact total duration by repeating the full animation, repeating the current preview-loop range, or holding the final frame.
+- Repeat mode supports partial final cycles while preserving exact per-frame timing; Hold mode adds no extra frames.
+- Extension uses normal document history, so Undo/Redo, dirty-state tracking, recovery, live playback, and GIF/MP4/WebM export continue to work without a separate timeline format.
+- Added memory-aware frame-count protection so an extreme repeat request is rejected with a useful alternative instead of exhausting memory.
+- Animation scrubber and loop bounds now resynchronize when an operation, Undo, or Redo changes the frame count.
+- Added repeat, loop-range, hold, exact-remainder, safety-limit, UI, scrubber, and undo regressions; the full suite now contains 179 tests.
+
+## 0.9.0 RC23
+
+Canvas and brush responsiveness hardening.
+
+- Replaced the canvas's single raster cache with a bounded two-image cache so Compare view no longer reconverts the edited and original full-resolution images on every repaint or split-slider movement.
+- Live-preview replacement now invalidates only the superseded preview raster, preserving the reusable original-image cache while effect controls are adjusted.
+- Brush strokes now reuse correctly clipped circular masks, including a cached feathered mask for Heal, instead of allocating and filtering a new mask for every stamp.
+- Black brush painting now reuses a cached solid patch, while blur, pixel, mosaic, clone, and heal stamps explicitly release temporary crop buffers as soon as they are used.
+- Switching documents during an unfinished brush stroke now rolls the partial stroke back instead of leaving an untracked edit with no undo entry or dirty revision.
+- Added compare-cache, brush-mask, edge-clipping, and interrupted-stroke regressions; the full suite now contains 174 tests.
+
 ## 0.9.0 RC22
 
 Adaptive animation editing and memory hardening.

@@ -7,15 +7,15 @@ from typing import Any, Callable, Optional, Sequence
 from threading import Lock
 import os
 
-import imageio.v2 as imageio
 from PIL import Image, ImageColor, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from imagesuite.utils import (
     HARD_ANIMATION_DECODED_PIXELS,
     available_memory_bytes,
     read_animated_media,
-    read_image,
+    read_image,  # noqa: F401 - retained as a compatibility seam for callers/tests
     read_processing_image,
+    probe_video,
     reserve_destination,
     save_animation,
     save_image,
@@ -50,6 +50,7 @@ class UpscaleSettings:
     gif_dither: bool = True
     gif_optimize: bool = False
     preserve_transparency: bool = True
+    preserve_audio: bool = True
     preserve_metadata: bool = True
     create_timestamped_folder: bool = True
     export_zip: bool = False
@@ -104,17 +105,13 @@ def _estimated_file_working_set(path: str | Path, settings: UpscaleSettings) -> 
     source = Path(path)
     if source.suffix.lower() in {".mp4", ".webm"}:
         try:
-            reader = imageio.get_reader(str(source))
-            try:
-                meta = reader.get_meta_data() or {}
-                width, height = meta.get("size") or meta.get("source_size") or (1280, 720)
-                fps = float(meta.get("fps") or 12.0)
-                duration = float(meta.get("duration") or 10.0)
-                frames = max(2, int(round(fps * duration)))
-                animated = True
-                has_alpha = False
-            finally:
-                reader.close()
+            meta = probe_video(source)
+            width, height = int(meta["width"]), int(meta["height"])
+            fps = float(meta["fps"] or 12.0)
+            duration = max(0.02, int(meta["duration_ms"]) / 1000)
+            frames = max(2, int(round(fps * duration)))
+            animated = True
+            has_alpha = False
         except Exception:
             return 256 * 1024**2, True
     else:
@@ -470,8 +467,6 @@ def _tile_candidates(initial: int, recover: bool) -> list[int]:
 
 
 def _tensor_tile_to_image(model: Any, tensor_u8: Any, device: Any, precision: str, torch: Any) -> Image.Image:
-    import numpy as np
-
     dtype = torch.float16 if precision == "FP16" else torch.float32
     tensor = tensor_u8.to(device=device, dtype=dtype).div_(255.0)
     with torch.inference_mode():
@@ -848,7 +843,25 @@ def _process_animated_media(
 
     try:
         target = _reserve_output_path(source, output_folder, settings, animated=True)
-        save_animation(processed_frames, durations, target, loop=loop, fps=settings.animation_fps, bitrate_kbps=settings.video_bitrate_kbps, gif_colors=settings.gif_colors, gif_dither=settings.gif_dither, gif_optimize=settings.gif_optimize)
+        preserve_source_audio = (
+            settings.preserve_audio
+            and Path(source).suffix.lower() in {".mp4", ".webm"}
+            and target.suffix.lower() in {".mp4", ".webm"}
+        )
+        save_animation(
+            processed_frames,
+            durations,
+            target,
+            loop=loop,
+            fps=settings.animation_fps,
+            bitrate_kbps=settings.video_bitrate_kbps,
+            gif_colors=settings.gif_colors,
+            gif_dither=settings.gif_dither,
+            gif_optimize=settings.gif_optimize,
+            audio_source=Path(source) if preserve_source_audio else None,
+            audio_start_ms=0,
+            audio_duration_ms=sum(durations),
+        )
         return target
     except Exception:
         if target is not None:

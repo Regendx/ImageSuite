@@ -5,9 +5,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PySide6 = pytest.importorskip("PySide6")
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
-from imagesuite.main_window import MainWindow
+from imagesuite.main_window import MainWindow, PreferencesDialog
 from imagesuite.editor.workspace import EditorWorkspace
 from imagesuite.models import RectMask
 
@@ -169,12 +170,15 @@ def test_upscale_animation_export_controls_round_trip(tmp_path: Path):
     assert settings.output_format == "MP4"
     assert settings.animation_fps == 24
     assert settings.video_bitrate_kbps == 2500
+    assert workspace.preserve_audio.isEnabled()
+    assert settings.preserve_audio
     workspace.format.setCurrentText("GIF")
     workspace.gif_colors.setValue(64)
     workspace.gif_dither.setChecked(False)
     settings = workspace.settings()
     assert settings.gif_colors == 64
     assert not settings.gif_dither
+    assert not workspace.preserve_audio.isEnabled()
     workspace.close()
 
 
@@ -200,6 +204,32 @@ def test_animation_scrubber_and_loop_bounds_work():
     assert workspace._gif_preview_index == 1
     workspace.close()
     path.unlink(missing_ok=True)
+
+
+def test_extend_animation_transform_updates_duration_and_scrubber(monkeypatch, tmp_path: Path):
+    from imagesuite.utils import read_image, save_animation
+    from PIL import Image
+    from PySide6.QtWidgets import QInputDialog
+
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / "extend.gif"
+    frames = [Image.new("RGBA", (16, 12), color) for color in ("red", "green", "blue")]
+    save_animation(frames, [100, 200, 300], source)
+    workspace = EditorWorkspace()
+    workspace.add_document(read_image(source), source, dirty=False)
+    monkeypatch.setattr(QInputDialog, "getDouble", lambda *args, **kwargs: (1.05, True))
+    monkeypatch.setattr(QInputDialog, "getItem", lambda *args, **kwargs: ("Repeat full animation", True))
+
+    assert "Extend animation duration…" in [workspace.transform_combo.itemText(i) for i in range(workspace.transform_combo.count())]
+    workspace.extend_animation_duration()
+
+    assert workspace.document.animation_duration_ms == 1050
+    assert workspace.document.frame_count == 6
+    assert workspace.anim_scrub.maximum() == 6
+    workspace.undo()
+    assert workspace.document.frame_count == 3
+    assert workspace.anim_scrub.maximum() == 3
+    workspace.close()
 
 
 def test_ai_profiles_and_controls_are_visible_in_ai_mode(tmp_path: Path):
@@ -268,6 +298,26 @@ def test_target_edge_controls_offer_hard_soft_and_custom_modes():
     workspace.close()
 
 
+def test_ascii_effect_defaults_to_color_preservation():
+    app = QApplication.instance() or QApplication([])
+    workspace = EditorWorkspace()
+    workspace.effect_combo.setCurrentText("ASCII Art")
+    assert workspace.effect_parameter_labels["angle"].text() == "Color preservation"
+    assert workspace.effect_parameter_sliders["angle"].value() == 72
+    workspace.close()
+
+
+
+
+def test_ascii_effect_exposes_tone_polarity_slider():
+    app = QApplication.instance() or QApplication([])
+    workspace = EditorWorkspace()
+    workspace.effect_combo.setCurrentText("ASCII Art")
+    assert not workspace.effect_parameter_rows["phase"].isHidden()
+    assert workspace.effect_parameter_labels["phase"].text() == "Tone polarity"
+    assert workspace.effect_parameter_sliders["phase"].value() == 0
+    workspace.close()
+
 def test_ascii_effect_exposes_contour_control():
     app = QApplication.instance() or QApplication([])
     workspace = EditorWorkspace()
@@ -276,3 +326,101 @@ def test_ascii_effect_exposes_contour_control():
     assert workspace.effect_parameter_labels["edge"].text() == "Contour strength"
     assert workspace.effect_parameter_sliders["edge"].value() == 76
     workspace.close()
+
+
+def test_editor_tool_panel_uses_resizable_splitter():
+    from PySide6.QtTest import QTest
+
+    app = QApplication.instance() or QApplication([])
+    workspace = EditorWorkspace()
+    workspace.resize(1200, 760)
+    workspace.show()
+    QTest.qWait(20)
+    assert workspace.editor_splitter.count() == 2
+    workspace.editor_splitter.setSizes([520, 680])
+    QTest.qWait(20)
+    assert workspace.sidebar.width() >= 430
+    workspace.close()
+
+
+def test_animation_import_and_export_dialogs_are_resizable():
+    from PIL import Image
+    from PySide6.QtCore import Qt
+    from imagesuite.editor.workspace import AnimationExportDialog, VideoImportDialog
+    from imagesuite.models import ANIMATION_DURATIONS_KEY, ANIMATION_FRAMES_KEY, ANIMATION_LOOP_KEY, ImageDocument
+
+    app = QApplication.instance() or QApplication([])
+    import_dialog = VideoImportDialog(
+        Path("large.mp4"),
+        {"duration_ms": 7200000, "fps": 30.0, "width": 3840, "height": 2160, "estimated_frames": 216000, "file_size": 8_000_000_000},
+    )
+    assert import_dialog.isSizeGripEnabled()
+    assert import_dialog.windowFlags() & Qt.WindowMaximizeButtonHint
+    assert import_dialog.options()["duration_ms"] == 7200000
+    assert import_dialog.timeline.out_ms == 7200000
+    import_dialog.timeline.set_range(120000, 180000)
+    assert import_dialog.options()["start_ms"] == 120000
+    assert import_dialog.options()["duration_ms"] == 60000
+
+    frames = [Image.new("RGBA", (16, 12), color) for color in ("red", "green", "blue")]
+    image = frames[0].copy()
+    image.info[ANIMATION_FRAMES_KEY] = frames
+    image.info[ANIMATION_DURATIONS_KEY] = [100, 200, 300]
+    image.info[ANIMATION_LOOP_KEY] = 0
+    document = ImageDocument.from_image(image)
+    export_dialog = AnimationExportDialog(document, ".gif")
+    assert export_dialog.isSizeGripEnabled()
+    assert export_dialog.windowFlags() & Qt.WindowMaximizeButtonHint
+    assert export_dialog.timeline.out_ms == 600
+    export_dialog.clip_seconds.setValue(0.40)
+    export_dialog.output_seconds.setValue(1.25)
+    options = export_dialog.options()
+    assert options["duration_ms"] == 400
+    assert options["output_duration_ms"] == 1250
+    export_dialog.close()
+    import_dialog.close()
+    document.close()
+
+
+def test_edited_video_keeps_preserve_audio_control_enabled(tmp_path: Path):
+    from PIL import Image
+    from imagesuite.models import ANIMATION_DURATIONS_KEY, ANIMATION_FRAMES_KEY, ImageDocument
+    from imagesuite.utils import VIDEO_SOURCE_DURATION_MS_KEY, VIDEO_SOURCE_PATH_KEY, VIDEO_SOURCE_START_MS_KEY
+    from imagesuite.editor.workspace import AnimationExportDialog
+
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    frames = [Image.new("RGBA", (16, 12), color) for color in ("red", "green")]
+    image = frames[0].copy()
+    image.info[ANIMATION_FRAMES_KEY] = frames
+    image.info[ANIMATION_DURATIONS_KEY] = [100, 100]
+    image.info[VIDEO_SOURCE_PATH_KEY] = str(source)
+    image.info[VIDEO_SOURCE_START_MS_KEY] = 0
+    image.info[VIDEO_SOURCE_DURATION_MS_KEY] = 200
+    document = ImageDocument.from_image(image, source)
+    document.commit_frames([frame.copy() for frame in document.animation_frames], durations=[100, 100])
+
+    dialog = AnimationExportDialog(document, ".mp4")
+    assert not dialog.direct_video.isEnabled()
+    assert dialog.preserve_audio.isEnabled()
+    assert dialog.preserve_audio.isChecked()
+    assert dialog.options()["preserve_audio"] is True
+    dialog.close()
+    document.close()
+
+
+def test_preferences_expose_update_controls():
+    app = QApplication.instance() or QApplication([])
+    settings = QSettings("Regendx", "ImageSuite-update-controls-test")
+    settings.clear()
+    dialog = PreferencesDialog(settings)
+    assert dialog.auto_updates.isChecked()
+    assert dialog.prerelease_updates.isChecked()
+    dialog.auto_updates.setChecked(False)
+    dialog.prerelease_updates.setChecked(False)
+    dialog.save()
+    assert settings.value("updates/automatic", True, type=bool) is False
+    assert settings.value("updates/include_prereleases", True, type=bool) is False
+    dialog.close()
+    settings.clear()

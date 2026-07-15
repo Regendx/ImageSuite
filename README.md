@@ -1,4 +1,4 @@
-# ImageSuite 0.9.0 RC22
+# ImageSuite 0.9.0 RC33
 
 ImageSuite combines QuickFX editing, UpMark enhancement and watermarking, and VisualDupe similarity cleanup in one native PySide6 desktop application.
 
@@ -8,6 +8,9 @@ This is a **release candidate**, not the final 1.0 release. The core application
 
 ### Edit
 
+- MP4/WebM files open in a resizable video-editor style clip window with playback, a thumbnail filmstrip, a playhead, draggable In/Out handles, Set In/Out buttons, and optional precise time fields
+- MP4/WebM export can preserve the matching source-audio segment even after visual edits; direct unedited export remains available for original-resolution video, while edited frames are rendered straight to video and remuxed with source audio
+- Video selection has no fixed five-minute ceiling; long or multi-hour ranges automatically use a sparse, memory-bounded editing proxy while preserving the complete selected duration
 - Large animation edits automatically use a memory-aware working copy instead of failing; playback duration is preserved, Undo restores the prior copy, and Reset restores the imported source
 - Continuous automatic previews while effect, correction, creative, and text settings are changing
 - Preview begins from the first rectangle/lasso/face-circle gesture; no extra Preview button or slider nudge is required
@@ -15,6 +18,8 @@ This is a **release candidate**, not the final 1.0 release. The core application
 - Rectangle and lasso selections
 - Multiple protected face circles
 - 28 curated censorship effects covering privacy blur, directional distortion, glass, tile scrambling, print styles, redaction, and digital interference
+- ASCII Art uses a font-calibrated 95-character luminance ramp, preserves source hues, detects equal-brightness color boundaries, and uses the existing Color preservation slider to move from compact stable palettes to full RGB
+- ASCII Art uses cached glyph masks and vectorized frame composition, restoring practical processing speed for GIF/MP4/WebM clips without removing color-aware contours
 - Effect-specific live controls: every visible slider is meaningful, relabeled for the selected effect, and irrelevant controls are hidden instead of disabled
 - Up to five independent parameters per effect, including mix/opacity, size, softness, detail, direction, texture, threshold, palette, and distortion controls
 - Multi-effect censor chains with drag-to-reorder and 19 tuned privacy/style presets
@@ -27,8 +32,13 @@ This is a **release candidate**, not the final 1.0 release. The core application
 - Simple sticker workflow with categorized emoji/symbol palettes and imported PNG/WebP/JPEG stickers; stickers can be moved, resized, rotated, faded, outlined, shadowed, cancelled, and reopened before the next edit
 - Arrows, boxes and creative effects
 - Brightness, contrast, saturation and sharpness corrections
-- Crop, resize, rotate, flip, reset and cinematic bars
+- Crop, resize, rotate, flip, reset, cinematic bars, and animation-duration extension by repeating a loop or holding the final frame
 - Adaptive GIF, MP4, and WebM editing with live playback: effects, chains, selections, corrections, creative looks, text, and stickers update on the moving animation before Apply
+- Core video probing, proxy decoding, thumbnails, and rendered encoding use the bundled FFmpeg directly, avoiding an intermediate GIF and preventing stale pipe/file-handle buildup during repeated video work
+- Animation Save As uses the same visible In/Out timeline and preview playback, and can set an exact GIF playback duration, palette size, dithering, and optimization
+- Unedited MP4/WebM clips can export directly from the original video through FFmpeg, preserving original resolution and audio without creating a GIF or loading the export back through Python frames
+- Edited MP4/WebM documents still encode straight from edited frames to video; the export dialog clearly distinguishes this rendered path from direct source export
+- The QuickFX tool column uses a draggable splitter that remembers its width, and video import/export dialogs can be resized or maximized
 - Multiple documents, recovery, chronological undo/redo and keyboard navigation
 
 ### Enhance
@@ -65,6 +75,27 @@ This is a **release candidate**, not the final 1.0 release. The core application
 
 ## Installation
 
+### Installed Windows build
+
+The GitHub release workflow builds a per-user Windows installer named **`ImageSuite-Setup-v<version>.exe`**. The installer does not require administrator rights and can add:
+
+- Start Menu and optional Desktop shortcuts
+- A dedicated **Open in ImageSuite** File Explorer command for images and videos
+- **Open folder in ImageSuite** for folders
+- Automatic update support through GitHub Releases
+
+The Explorer command is a direct shell action, not an **Open with** file association, so ImageSuite does not take over the default app for any file type. On Windows 11, traditional third-party shell commands may appear inside **Show more options**.
+
+ImageSuite uses one running application instance. Right-clicking additional files sends them to the existing window instead of launching duplicate editors.
+
+### Updates
+
+Installed Windows builds check GitHub Releases at most once per day by default. Update checks can be disabled, and release-candidate updates can be included or excluded under **Help → Preferences**. **Help → Check for updates…** always performs a manual check.
+
+ImageSuite asks before downloading and again before installation. When GitHub provides an asset SHA-256 digest, the downloaded installer is verified before it can run. Installation begins only after ImageSuite closes, then the app reopens automatically.
+
+For the updater to recognize a release, attach an installer asset whose filename contains **ImageSuite**, **Setup**, and ends in **`.exe`**. The included release workflow does this automatically for version tags.
+
 ### Source launcher
 
 1. Extract the entire ZIP.
@@ -90,10 +121,10 @@ This runs the release self-check, all tests and PyInstaller before creating a po
 After installing Inno Setup 6, run:
 
 ```text
-build_installer.bat
+developer_tools\build_installer.bat
 ```
 
-The installer is per-user and does not require administrator privileges.
+The installer is per-user, does not require administrator privileges, and includes the optional File Explorer command. Tagging a commit as `v0.9.0-RC33` also runs `.github/workflows/release.yml`, builds the installer on Windows, and attaches it to the GitHub Release used by the updater.
 
 ### AI-enabled executable build
 
@@ -185,7 +216,9 @@ Supported image files:
 - TIFF
 - GIF
 
-Animated GIF, MP4, and WebM files are supported in Edit and Enhance. Large animations are imported through a bounded working copy that can reduce frame count or resolution instead of rejecting the file immediately. ImageSuite preserves animation duration and supports GIF, MP4, and WebM export. Use the animation controls below the canvas, or press `Ctrl+Space`, to play the animation while changing effects, masks, corrections, creative effects, and Quick Text. Apply still processes every retained working frame at full working resolution.
+Animated GIF, MP4, and WebM files are supported in Edit and Enhance. MP4/WebM import and export provide a visible timeline with preview playback and draggable In/Out handles. There is no fixed clip-duration ceiling: long selections use a bounded proxy that reduces temporal or spatial detail as needed while preserving the complete selected duration. ImageSuite preserves animation timing and supports GIF, MP4, and WebM export. Use **Transform → Extend animation duration…** to repeat the full animation, repeat the current preview-loop range, or hold the final frame until an exact target duration. Use the animation controls below the canvas, or press `Ctrl+Space`, to play the animation while changing effects, masks, corrections, creative effects, and Quick Text.
+
+For an unedited MP4/WebM, direct export trims the original source at full resolution and retains audio without using the proxy or a GIF conversion. Pixel-edited video is rendered from the editable proxy, so extremely long sources may intentionally contain less temporal detail than the original. This keeps memory bounded; ImageSuite is not yet a full non-linear video compositor that replays every image-editing operation against every original source frame.
 
 Brush, clone, and heal remain unavailable for animations because copying one frame's painted pixels into every frame would corrupt motion. Multi-page TIFF files are still rejected rather than silently editing one page. Extremely large animations can still exceed the hard safety ceiling and may need trimming or resolution reduction.
 

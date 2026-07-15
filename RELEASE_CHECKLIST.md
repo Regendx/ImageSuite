@@ -1,23 +1,33 @@
 # ImageSuite 1.0 release checklist
 
-`0.9.0 RC22` has completed the code-side reliability pass. Do not rename it to `1.0.0` until the required Windows checks below are completed against the exact packaged artifacts.
+`0.9.0 RC33` has completed the code-side reliability pass. Do not rename it to `1.0.0` until the required Windows checks below are completed against the exact packaged artifacts.
 
-## Automated gate — completed for RC21
+## Automated gate — completed for RC33
 
 - [x] Full Python compilation
 - [x] Release self-check
 - [x] Unit and offscreen PySide6 tests
 - [x] Empty-canvas mouse regression
 - [x] Tab-switch interaction-state regression
+- [x] Interrupted brush rollback and brush-mask reuse regressions
+- [x] Compare-view dual-raster cache regression
 - [x] Save/undo/redo dirty-state regression
 - [x] Selection and face-circle undo/redo regression
 - [x] Atomic save regression
 - [x] Recovery write/removal regression
 - [x] Damaged recovery quarantine regression
 - [x] Animated GIF 10-second boundary, frame timing, loop, undo/redo, recovery, live effect/text/correction playback, frame skipping, and Enhance regressions
+- [x] Animation duration extension by full-loop repeat, selected-loop repeat, final-frame hold, exact timing, frame safety limit, scrubber synchronization, and undo/redo regressions
+- [x] Large-video seek/segment/FPS/downscale import, cancellation progress, exact GIF range/timing export, and resizable animation-dialog regressions
+- [x] Direct MP4/WebM source export with original timeline mapping, no GIF/frame-export fallback, original-resolution video, and optional source audio mapping
+- [x] Edited MP4/WebM source-audio remux, explicit audio removal, and Enhance/Batch source-audio forwarding regressions
+- [x] Direct bundled-FFmpeg probe/decode/encode path under strict resource-warning checks
+- [x] Video-editor style import/export timeline, thumbnail fast-seek, draggable In/Out handles, and multi-hour proxy planning without a five-minute rejection
+- [x] Draggable editor tool-sidebar splitter regression
 - [x] Multi-page TIFF rejection regression
 - [x] Move rollback and duplicate-output regression
 - [x] Launcher/build-script static checks
+- [x] Installer Explorer shell verbs, single-instance path payloads, updater version/asset selection, SHA-256 verification, and Windows release-workflow regressions
 - [x] Continuous-slider live-preview regression
 - [x] Preview/apply consistency for all editor effects and creative looks
 - [x] Randomized image/effect/mask compatibility audit
@@ -25,7 +35,12 @@
 - [x] Pillow 12.3 full-image and Sketch compatibility regressions
 - [x] Full suite under PySide6 6.11.1, Pillow 12.3.0 and NumPy 2.4.6
 - [x] Standalone editor shutdown/executor regression
+- [x] Hidden/embedded workspace deterministic close, repeated tab close/edit, background-preview preservation, and 50-cycle file-handle plateau checks
+- [x] Recovery snapshot ownership, animation timing-cache reuse, effect-chain intermediate release, and mask/layer lifecycle regressions
 - [x] All 28 curated censorship effects and 19 tuned presets exercised through the PySide6 workspace
+- [x] Color-aware ASCII hue preservation, equal-luminance color-boundary contours, and smooth-gradient glyph-ramp regressions, plus tone-polarity inversion regressions
+- [x] Vectorized ASCII glyph composition, per-size glyph-mask caching, and animation-performance regression preventing per-cell font rasterization
+- [x] Font-calibrated 95-character ASCII ramp, complete tonal-span sampling, slider-driven RGB precision, and cached 256-value luminance mapping
 - [x] Every visible effect parameter changes output; per-entry chain settings, chained-effect fuzzing, alpha preservation and deterministic preview/apply regressions
 - [x] Parallel worker range and AI single-worker behavior regression
 - [x] Built-in and persistent custom text watermark preset regression
@@ -46,6 +61,9 @@ Test the exact portable ZIP and installer produced by `developer_tools\build_rel
 - [ ] Portable build launches from a normal local folder
 - [ ] Installer completes without administrator rights
 - [ ] Start-menu and optional desktop shortcuts work
+- [ ] Dedicated Open in ImageSuite image/video command works, including multiple selections and forwarding into an existing window
+- [ ] Open folder in ImageSuite works and uninstall removes all Explorer commands
+- [ ] Automatic and manual update checks find a tagged GitHub Release, download its installer, close safely, update, and reopen
 - [ ] Uninstall removes the program folder without deleting user-created output or recovery data
 - [ ] Core application launches while offline
 

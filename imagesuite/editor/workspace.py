@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
@@ -12,8 +13,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from PIL.ImageQt import ImageQt, fromqimage
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QKeyEvent, QShortcut, QKeySequence
+from PySide6.QtCore import QUrl, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QPixmap, QShortcut, QKeySequence
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -22,7 +25,11 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -38,6 +45,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QSplitter,
+    QStackedWidget,
     QTabBar,
     QTextEdit,
     QTabWidget,
@@ -48,16 +57,26 @@ from PySide6.QtWidgets import (
 
 from imagesuite.editor import effects
 from imagesuite.editor.canvas import ImageCanvas
-from imagesuite.models import ImageDocument, RectMask
+from imagesuite.editor.timeline import RangeTimeline
+from imagesuite.models import ANIMATION_FRAMES_KEY, ImageDocument, RectMask
 from imagesuite.diagnostics import log_warning, show_operation_error
+_RECOVERY_SAVE_LOCK = threading.Lock()
+
 from imagesuite.utils import (
     IMAGE_FILE_FILTER,
+    AnimationReadCancelled,
     atomic_write_text,
     app_data_dir,
+    choose_animation_reduction,
     expand_image_paths,
+    export_video_segment,
     open_folder,
+    probe_video,
     read_image,
+    read_video_timeline_thumbnails,
+    retime_animation_durations,
     save_animation,
+    slice_animation,
     save_image,
     unique_destination,
 )
@@ -68,6 +87,654 @@ class MultilineTextEdit(QTextEdit):
 
     def text(self) -> str:
         return self.toPlainText()
+
+
+def _human_file_size(value: int) -> str:
+    size = float(max(0, value))
+    for suffix in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or suffix == "TB":
+            return f"{size:.0f} {suffix}" if suffix == "B" else f"{size:.1f} {suffix}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+class VideoImportDialog(QDialog):
+    """Video-editor style source preview and in/out range chooser."""
+
+    def __init__(self, source: Path, info: dict[str, int | float], parent=None) -> None:
+        super().__init__(parent)
+        self.source = source
+        self.info = info
+        self._duration_ms = max(20, int(info.get("duration_ms", 0) or 0))
+        self._range_syncing = False
+        self._thumbnail_cancel = threading.Event()
+        self._thumbnail_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-filmstrip")
+        self._thumbnail_future: Future | None = None
+        self.setWindowTitle("Open video")
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(720, 620)
+        self.resize(920, 760)
+
+        root = QVBoxLayout(self)
+        heading = QLabel(f"Choose the part of {source.name} to edit", objectName="Brand")
+        heading.setWordWrap(True)
+        root.addWidget(heading)
+        details = QLabel(
+            f"Source: {int(info['width'])}×{int(info['height'])} · "
+            f"{float(info['fps']):.2f} fps · {self._format_ms(self._duration_ms)} · "
+            f"{_human_file_size(int(info['file_size']))}",
+            objectName="Muted",
+        )
+        details.setWordWrap(True)
+        root.addWidget(details)
+
+        self.preview_stack = QStackedWidget()
+        self.poster_label = QLabel("Preparing video preview…", objectName="Muted")
+        self.poster_label.setAlignment(Qt.AlignCenter)
+        self.poster_label.setMinimumHeight(300)
+        self.poster_label.setFrameShape(QFrame.StyledPanel)
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(300)
+        self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
+        self.preview_stack.addWidget(self.poster_label)
+        self.preview_stack.addWidget(self.video_widget)
+        self.preview_stack.setCurrentWidget(self.poster_label)
+        root.addWidget(self.preview_stack, 1)
+        self.audio_output: QAudioOutput | None = None
+        self.player: QMediaPlayer | None = None
+        if source.exists():
+            self.audio_output = QAudioOutput(self)
+            self.audio_output.setVolume(0.65)
+            self.player = QMediaPlayer(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.player.setVideoOutput(self.video_widget)
+            self.player.setSource(QUrl.fromLocalFile(str(source.resolve())))
+            self.player.positionChanged.connect(self._player_position_changed)
+            self.player.durationChanged.connect(self._player_duration_changed)
+            self.player.playbackStateChanged.connect(self._playback_state_changed)
+            self.player.errorOccurred.connect(self._player_error)
+
+        playback_row = QHBoxLayout()
+        self.play_button = QPushButton("▶ Play")
+        self.play_button.clicked.connect(self._toggle_playback)
+        playback_row.addWidget(self.play_button)
+        set_in = QPushButton("Set In")
+        set_in.clicked.connect(self._set_in_at_playhead)
+        playback_row.addWidget(set_in)
+        set_out = QPushButton("Set Out")
+        set_out.clicked.connect(self._set_out_at_playhead)
+        playback_row.addWidget(set_out)
+        select_all = QPushButton("Select full video")
+        select_all.clicked.connect(self._select_all)
+        playback_row.addWidget(select_all)
+        playback_row.addStretch(1)
+        self.position_label = QLabel("0:00.00 / " + self._format_ms(self._duration_ms), objectName="Muted")
+        playback_row.addWidget(self.position_label)
+        root.addLayout(playback_row)
+
+        self.timeline = RangeTimeline()
+        self.timeline.set_duration(self._duration_ms)
+        self.timeline.set_range(0, self._duration_ms)
+        self.timeline.rangeChanged.connect(self._timeline_range_changed)
+        self.timeline.playheadChanged.connect(self._seek_player)
+        root.addWidget(self.timeline)
+
+        form = QFormLayout()
+        self.start_seconds = QDoubleSpinBox()
+        self.start_seconds.setDecimals(3)
+        self.start_seconds.setSingleStep(0.25)
+        self.start_seconds.setSuffix(" s")
+        self.start_seconds.setRange(0.0, max(0.0, self._duration_ms / 1000 - 0.02))
+        form.addRow("Precise start", self.start_seconds)
+
+        self.duration_seconds = QDoubleSpinBox()
+        self.duration_seconds.setDecimals(3)
+        self.duration_seconds.setSingleStep(0.25)
+        self.duration_seconds.setSuffix(" s")
+        self.duration_seconds.setRange(0.02, self._duration_ms / 1000)
+        self.duration_seconds.setValue(self._duration_ms / 1000)
+        form.addRow("Precise duration", self.duration_seconds)
+
+        self.target_fps = QSpinBox()
+        self.target_fps.setRange(1, 60)
+        self.target_fps.setSuffix(" fps")
+        self.target_fps.setValue(max(1, min(12, round(float(info["fps"])))))
+        self.target_fps.setToolTip("This controls the editable proxy, not direct source-video export quality.")
+        form.addRow("Editing proxy frame rate", self.target_fps)
+
+        self.max_side = QSpinBox()
+        self.max_side.setRange(0, 7680)
+        self.max_side.setSpecialValueText("Original")
+        self.max_side.setSuffix(" px")
+        source_side = max(int(info["width"]), int(info["height"]))
+        self.max_side.setValue(1280 if source_side > 1280 else 0)
+        self.max_side.setToolTip("Caps the editable proxy only. Direct MP4/WebM export still uses the original source.")
+        form.addRow("Editing proxy maximum edge", self.max_side)
+        root.addLayout(form)
+
+        note = QLabel(
+            "There is no fixed clip-length limit. Long selections are opened as a sparse, memory-bounded editing proxy. "
+            "Unedited MP4/WebM export continues to read the original video directly at full resolution with audio.",
+            objectName="Muted",
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+        self.estimate = QLabel(objectName="Muted")
+        self.estimate.setWordWrap(True)
+        root.addWidget(self.estimate)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Open).setText("Open selected range")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.start_seconds.valueChanged.connect(self._precision_range_changed)
+        self.duration_seconds.valueChanged.connect(self._precision_range_changed)
+        self.target_fps.valueChanged.connect(self._update_estimate)
+        self.max_side.valueChanged.connect(self._update_estimate)
+        self._precision_range_changed()
+        self._start_filmstrip_load()
+
+    @staticmethod
+    def _format_ms(value_ms: int) -> str:
+        total_seconds = max(0, int(value_ms)) / 1000
+        minutes = int(total_seconds // 60)
+        seconds = total_seconds - minutes * 60
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours:d}:{minutes:02d}:{seconds:05.2f}"
+        return f"{minutes:d}:{seconds:05.2f}"
+
+    def _start_filmstrip_load(self) -> None:
+        if not self.source.exists():
+            return
+        self._thumbnail_future = self._thumbnail_executor.submit(
+            read_video_timeline_thumbnails,
+            self.source,
+            duration_ms=self._duration_ms,
+            count=10,
+            cancel=self._thumbnail_cancel.is_set,
+        )
+        self._thumbnail_poll = QTimer(self)
+        self._thumbnail_poll.setInterval(80)
+        self._thumbnail_poll.timeout.connect(self._poll_filmstrip)
+        self._thumbnail_poll.start()
+
+    def _poll_filmstrip(self) -> None:
+        future = self._thumbnail_future
+        if future is None or not future.done():
+            return
+        self._thumbnail_poll.stop()
+        try:
+            images = future.result()
+            pixmaps = [QPixmap.fromImage(ImageQt(image)) for image in images]
+            self.timeline.set_thumbnails(pixmaps)
+            if pixmaps:
+                self.poster_label.setText("")
+                self.poster_label.setPixmap(
+                    pixmaps[0].scaled(760, 430, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+            for image in images:
+                image.close()
+        except Exception:
+            pass
+
+    def _player_duration_changed(self, duration_ms: int) -> None:
+        if duration_ms <= 0 or abs(duration_ms - self._duration_ms) < 20:
+            return
+        old_full_selection = self.timeline.in_ms == 0 and self.timeline.out_ms == self._duration_ms
+        self._duration_ms = max(20, int(duration_ms))
+        self.timeline.set_duration(self._duration_ms)
+        if old_full_selection:
+            self.timeline.set_range(0, self._duration_ms)
+            self.duration_seconds.setValue(self._duration_ms / 1000)
+        self.start_seconds.setMaximum(max(0.0, self._duration_ms / 1000 - 0.02))
+        self._precision_range_changed()
+
+    def _player_position_changed(self, position_ms: int) -> None:
+        self.timeline.set_playhead(position_ms)
+        self.position_label.setText(f"{self._format_ms(position_ms)} / {self._format_ms(self._duration_ms)}")
+        if self.player is not None and self.player.playbackState() == QMediaPlayer.PlayingState and position_ms >= self.timeline.out_ms:
+            self.player.pause()
+            self.player.setPosition(self.timeline.in_ms)
+
+    def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        self.play_button.setText("❚❚ Pause" if state == QMediaPlayer.PlayingState else "▶ Play")
+
+    def _player_error(self, _error: QMediaPlayer.Error, message: str) -> None:
+        self.preview_stack.setCurrentWidget(self.poster_label)
+        if self.poster_label.pixmap().isNull():
+            self.poster_label.setText("Video playback preview is unavailable. The filmstrip and trim handles still work.")
+        self.play_button.setEnabled(False)
+        self.play_button.setToolTip(message or "Qt could not play this source video on the current system.")
+
+    def _toggle_playback(self) -> None:
+        if self.player is None:
+            return
+        self.preview_stack.setCurrentWidget(self.video_widget)
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+            return
+        position = self.player.position()
+        if position < self.timeline.in_ms or position >= self.timeline.out_ms:
+            self.player.setPosition(self.timeline.in_ms)
+        self.player.play()
+
+    def _seek_player(self, position_ms: int) -> None:
+        if self.player is not None:
+            self.preview_stack.setCurrentWidget(self.video_widget)
+            self.player.setPosition(max(0, min(position_ms, self._duration_ms)))
+
+    def _set_in_at_playhead(self) -> None:
+        self.timeline.set_range(min(self.timeline.playhead_ms, self.timeline.out_ms - 20), self.timeline.out_ms, emit=True)
+
+    def _set_out_at_playhead(self) -> None:
+        self.timeline.set_range(self.timeline.in_ms, max(self.timeline.playhead_ms, self.timeline.in_ms + 20), emit=True)
+
+    def _select_all(self) -> None:
+        self.timeline.set_range(0, self._duration_ms, emit=True)
+        self.timeline.set_playhead(0, emit=True)
+
+    def _timeline_range_changed(self, start_ms: int, end_ms: int) -> None:
+        if self._range_syncing:
+            return
+        self._range_syncing = True
+        try:
+            self.start_seconds.blockSignals(True)
+            self.duration_seconds.blockSignals(True)
+            self.start_seconds.setValue(start_ms / 1000)
+            self.duration_seconds.setMaximum(max(0.02, (self._duration_ms - start_ms) / 1000))
+            self.duration_seconds.setValue((end_ms - start_ms) / 1000)
+        finally:
+            self.start_seconds.blockSignals(False)
+            self.duration_seconds.blockSignals(False)
+            self._range_syncing = False
+        self._update_estimate()
+
+    def _precision_range_changed(self) -> None:
+        if self._range_syncing:
+            return
+        self._range_syncing = True
+        try:
+            start_ms = round(self.start_seconds.value() * 1000)
+            remaining_ms = max(20, self._duration_ms - start_ms)
+            self.duration_seconds.setMaximum(remaining_ms / 1000)
+            duration_ms = min(remaining_ms, max(20, round(self.duration_seconds.value() * 1000)))
+            self.timeline.set_range(start_ms, start_ms + duration_ms)
+        finally:
+            self._range_syncing = False
+        self._update_estimate()
+
+    def _update_estimate(self) -> None:
+        duration_ms = max(20, self.timeline.out_ms - self.timeline.in_ms)
+        requested_frames = max(2, math.ceil(duration_ms * self.target_fps.value() / 1000))
+        width, height = int(self.info["width"]), int(self.info["height"])
+        try:
+            stride, budget_scale, _reduced = choose_animation_reduction(requested_frames, duration_ms, width, height)
+            cap = self.max_side.value()
+            side_scale = min(1.0, cap / max(width, height)) if cap > 0 and max(width, height) else 1.0
+            scale = min(budget_scale, side_scale)
+            proxy_frames = max(2, math.ceil(requested_frames / stride))
+            proxy_width = max(1, round(width * scale))
+            proxy_height = max(1, round(height * scale))
+            decoded_bytes = proxy_frames * proxy_width * proxy_height * 4
+            proxy_fps = self.target_fps.value() / stride
+            self.estimate.setText(
+                f"Selected {self._format_ms(duration_ms)} · editing proxy about {proxy_frames:,} frames at "
+                f"{proxy_fps:.2f} fps and {proxy_width}×{proxy_height} · roughly "
+                f"{_human_file_size(decoded_bytes * 2)} for current + original proxy frames before history."
+            )
+        except Exception as exc:
+            self.estimate.setText(str(exc))
+
+    def options(self) -> dict[str, object]:
+        return {
+            "start_ms": self.timeline.in_ms,
+            "duration_ms": self.timeline.out_ms - self.timeline.in_ms,
+            "target_fps": self.target_fps.value(),
+            "max_side": self.max_side.value() or None,
+        }
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        if self.player is not None:
+            self.player.stop()
+        self._thumbnail_cancel.set()
+        if hasattr(self, "_thumbnail_poll"):
+            self._thumbnail_poll.stop()
+        self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
+        super().done(result)
+
+
+class AnimationExportDialog(QDialog):
+    """Visual in/out timeline and format options for animation/video export."""
+
+    def __init__(self, document: ImageDocument, suffix: str, parent=None) -> None:
+        super().__init__(parent)
+        self.document = document
+        self.suffix = suffix.lower()
+        self.total_ms = max(20, document.animation_duration_ms)
+        self.total_seconds = self.total_ms / 1000
+        self._range_syncing = False
+        self._preview_started_at = 0.0
+        self._frame_starts: list[int] = []
+        cursor = 0
+        for duration in document.frame_durations:
+            self._frame_starts.append(cursor)
+            cursor += max(10, int(duration or 100))
+        self.setWindowTitle("Video export" if self.suffix in {".mp4", ".webm"} else "Animation export")
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(720, 620)
+        self.resize(920, 760)
+
+        root = QVBoxLayout(self)
+        title = QLabel("Choose the export range on the timeline", objectName="Brand")
+        title.setWordWrap(True)
+        root.addWidget(title)
+        info = QLabel(
+            f"Current document: {document.frame_count:,} frames · {self._format_ms(self.total_ms)} · "
+            f"{document.image.width}×{document.image.height}",
+            objectName="Muted",
+        )
+        root.addWidget(info)
+
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(250)
+        self.preview_label.setFrameShape(QFrame.StyledPanel)
+        root.addWidget(self.preview_label, 1)
+
+        playback_row = QHBoxLayout()
+        self.preview_play_button = QPushButton("▶ Play selection")
+        self.preview_play_button.clicked.connect(self._toggle_preview)
+        playback_row.addWidget(self.preview_play_button)
+        set_in = QPushButton("Set In")
+        set_in.clicked.connect(self._set_in_at_playhead)
+        playback_row.addWidget(set_in)
+        set_out = QPushButton("Set Out")
+        set_out.clicked.connect(self._set_out_at_playhead)
+        playback_row.addWidget(set_out)
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(self._select_all)
+        playback_row.addWidget(select_all)
+        playback_row.addStretch(1)
+        self.preview_position_label = QLabel(objectName="Muted")
+        playback_row.addWidget(self.preview_position_label)
+        root.addLayout(playback_row)
+
+        self.timeline = RangeTimeline()
+        self.timeline.set_duration(self.total_ms)
+        self.timeline.set_range(0, self.total_ms)
+        self.timeline.set_thumbnails(self._document_thumbnails())
+        self.timeline.rangeChanged.connect(self._timeline_range_changed)
+        self.timeline.playheadChanged.connect(self._show_preview_at)
+        root.addWidget(self.timeline)
+
+        form = QFormLayout()
+        self.start_seconds = QDoubleSpinBox()
+        self.start_seconds.setDecimals(3)
+        self.start_seconds.setSingleStep(0.10)
+        self.start_seconds.setSuffix(" s")
+        self.start_seconds.setRange(0.0, max(0.0, self.total_seconds - 0.02))
+        form.addRow("Precise start", self.start_seconds)
+
+        self.clip_seconds = QDoubleSpinBox()
+        self.clip_seconds.setDecimals(3)
+        self.clip_seconds.setSingleStep(0.10)
+        self.clip_seconds.setSuffix(" s")
+        self.clip_seconds.setRange(0.02, self.total_seconds)
+        self.clip_seconds.setValue(self.total_seconds)
+        form.addRow("Precise range duration", self.clip_seconds)
+
+        self.output_seconds = QDoubleSpinBox()
+        self.output_seconds.setDecimals(3)
+        self.output_seconds.setSingleStep(0.10)
+        self.output_seconds.setSuffix(" s")
+        self.output_seconds.setRange(0.02, max(1_000_000.0, self.total_seconds))
+        self.output_seconds.setValue(self.total_seconds)
+        self.output_seconds.setToolTip("Changes GIF playback speed without changing the selected source frames.")
+        if self.suffix == ".gif":
+            form.addRow("Exported GIF duration", self.output_seconds)
+
+        self.gif_colors = QSpinBox()
+        self.gif_colors.setRange(2, 256)
+        self.gif_colors.setValue(256)
+        if self.suffix == ".gif":
+            form.addRow("GIF colors", self.gif_colors)
+        self.gif_dither = QCheckBox("Dither colors")
+        self.gif_dither.setChecked(True)
+        if self.suffix == ".gif":
+            form.addRow("GIF palette", self.gif_dither)
+        self.gif_optimize = QCheckBox("Optimize GIF file size (slower)")
+        if self.suffix == ".gif":
+            form.addRow("Compression", self.gif_optimize)
+
+        self.video_fps = QSpinBox()
+        self.video_fps.setRange(0, 60)
+        self.video_fps.setSpecialValueText("Automatic")
+        self.video_fps.setSuffix(" fps")
+        self.video_bitrate = QSpinBox()
+        self.video_bitrate.setRange(0, 100000)
+        self.video_bitrate.setSpecialValueText("Automatic")
+        self.video_bitrate.setSuffix(" kbps")
+        self.direct_video = QCheckBox("Use original video directly (fast, full resolution, preserves audio)")
+        direct_source = document.direct_video_source
+        self.direct_video.setEnabled(direct_source is not None)
+        self.direct_video.setChecked(direct_source is not None)
+        if direct_source is None:
+            self.direct_video.setToolTip(
+                "Direct source export is available only while an imported MP4/WebM still matches its original pixels."
+            )
+        self.preserve_audio = QCheckBox("Preserve source audio when available")
+        source_video = document.source_video
+        self.preserve_audio.setEnabled(source_video is not None)
+        self.preserve_audio.setChecked(source_video is not None)
+        if source_video is None:
+            self.preserve_audio.setToolTip("This document was not imported from an available MP4/WebM source.")
+        else:
+            self.preserve_audio.setToolTip(
+                "For edited video, ImageSuite renders the new frames first and then attaches the matching source-audio segment."
+            )
+        if self.suffix in {".mp4", ".webm"}:
+            form.addRow("Video source", self.direct_video)
+            form.addRow("Audio", self.preserve_audio)
+            form.addRow("Video frame rate", self.video_fps)
+            form.addRow("Video bitrate", self.video_bitrate)
+        root.addLayout(form)
+
+        self.summary = QLabel(objectName="Muted")
+        self.summary.setWordWrap(True)
+        root.addWidget(self.summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Export selected range")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(30)
+        self._preview_timer.timeout.connect(self._preview_tick)
+        self.start_seconds.valueChanged.connect(self._precision_range_changed)
+        self.clip_seconds.valueChanged.connect(self._precision_range_changed)
+        self.output_seconds.valueChanged.connect(self._update_summary)
+        self.direct_video.toggled.connect(self._update_summary)
+        self.preserve_audio.toggled.connect(self._update_summary)
+        self._show_preview_at(0)
+        self._update_summary()
+
+    @staticmethod
+    def _format_ms(value_ms: int) -> str:
+        return RangeTimeline._format_ms(value_ms)
+
+    def _document_thumbnails(self) -> list[QPixmap]:
+        frames = self.document.animation_frames
+        if not frames:
+            return []
+        count = min(14, len(frames))
+        indices = [round(index * (len(frames) - 1) / max(1, count - 1)) for index in range(count)]
+        pixmaps: list[QPixmap] = []
+        for index in indices:
+            frame = frames[index]
+            preview = frame.copy() if frame.mode == "RGBA" else frame.convert("RGBA")
+            try:
+                preview.thumbnail((160, 90), Image.Resampling.LANCZOS)
+                pixmaps.append(QPixmap.fromImage(ImageQt(preview)))
+            finally:
+                preview.close()
+        return pixmaps
+
+    def _frame_index_at(self, position_ms: int) -> int:
+        if not self._frame_starts:
+            return 0
+        return max(0, min(len(self._frame_starts) - 1, bisect_right(self._frame_starts, position_ms) - 1))
+
+    def _show_preview_at(self, position_ms: int) -> None:
+        position = max(0, min(int(position_ms), self.total_ms))
+        self.timeline.set_playhead(position)
+        frame = self.document.animation_frames[self._frame_index_at(position)]
+        preview = frame.copy() if frame.mode == "RGBA" else frame.convert("RGBA")
+        try:
+            preview.thumbnail((760, 390), Image.Resampling.LANCZOS)
+            self.preview_label.setPixmap(QPixmap.fromImage(ImageQt(preview)))
+        finally:
+            preview.close()
+        self.preview_position_label.setText(f"{self._format_ms(position)} / {self._format_ms(self.total_ms)}")
+
+    def _toggle_preview(self) -> None:
+        if self._preview_timer.isActive():
+            self._stop_preview()
+            return
+        position = self.timeline.playhead_ms
+        if position < self.timeline.in_ms or position >= self.timeline.out_ms:
+            position = self.timeline.in_ms
+            self._show_preview_at(position)
+        self._preview_started_at = time.monotonic() - (position - self.timeline.in_ms) / 1000
+        self._preview_timer.start()
+        self.preview_play_button.setText("❚❚ Pause")
+
+    def _stop_preview(self) -> None:
+        self._preview_timer.stop()
+        self.preview_play_button.setText("▶ Play selection")
+
+    def _preview_tick(self) -> None:
+        position = self.timeline.in_ms + round((time.monotonic() - self._preview_started_at) * 1000)
+        if position >= self.timeline.out_ms:
+            self._stop_preview()
+            self._show_preview_at(self.timeline.in_ms)
+            return
+        self._show_preview_at(position)
+
+    def _set_in_at_playhead(self) -> None:
+        self.timeline.set_range(min(self.timeline.playhead_ms, self.timeline.out_ms - 20), self.timeline.out_ms, emit=True)
+
+    def _set_out_at_playhead(self) -> None:
+        self.timeline.set_range(self.timeline.in_ms, max(self.timeline.playhead_ms, self.timeline.in_ms + 20), emit=True)
+
+    def _select_all(self) -> None:
+        self.timeline.set_range(0, self.total_ms, emit=True)
+        self._show_preview_at(0)
+
+    def _timeline_range_changed(self, start_ms: int, end_ms: int) -> None:
+        if self._range_syncing:
+            return
+        self._range_syncing = True
+        try:
+            self.start_seconds.blockSignals(True)
+            self.clip_seconds.blockSignals(True)
+            self.start_seconds.setValue(start_ms / 1000)
+            self.clip_seconds.setMaximum(max(0.02, (self.total_ms - start_ms) / 1000))
+            self.clip_seconds.setValue((end_ms - start_ms) / 1000)
+            if self.suffix == ".gif":
+                self.output_seconds.setValue((end_ms - start_ms) / 1000)
+        finally:
+            self.start_seconds.blockSignals(False)
+            self.clip_seconds.blockSignals(False)
+            self._range_syncing = False
+        if not start_ms <= self.timeline.playhead_ms <= end_ms:
+            self._show_preview_at(start_ms)
+        self._update_summary()
+
+    def _precision_range_changed(self) -> None:
+        if self._range_syncing:
+            return
+        self._range_syncing = True
+        try:
+            start_ms = round(self.start_seconds.value() * 1000 / 10) * 10
+            remaining_ms = max(20, self.total_ms - start_ms)
+            self.clip_seconds.setMaximum(remaining_ms / 1000)
+            clip_ms = min(remaining_ms, max(20, round(self.clip_seconds.value() * 1000 / 10) * 10))
+            self.timeline.set_range(start_ms, start_ms + clip_ms)
+            if self.suffix == ".gif":
+                self.output_seconds.setValue(clip_ms / 1000)
+        finally:
+            self._range_syncing = False
+        self._update_summary()
+
+    # Compatibility entrypoints kept for older automation/tests.
+    def _range_changed(self) -> None:
+        self._precision_range_changed()
+
+    def _clip_changed(self) -> None:
+        self._precision_range_changed()
+
+    def _update_summary(self) -> None:
+        try:
+            frames, durations = slice_animation(
+                self.document.animation_frames,
+                self.document.frame_durations,
+                start_ms=self.timeline.in_ms,
+                duration_ms=self.timeline.out_ms - self.timeline.in_ms,
+            )
+            minimum = max(0.02, len(frames) / 100)
+            if self.suffix == ".gif":
+                self.output_seconds.setMinimum(minimum)
+            target = self.output_seconds.value() if self.suffix == ".gif" else sum(durations) / 1000
+            if self.suffix in {".mp4", ".webm"} and self.direct_video.isChecked():
+                source = self.document.direct_video_source
+                audio_text = "with source audio when present" if self.preserve_audio.isChecked() else "without audio"
+                self.summary.setText(
+                    f"Direct FFmpeg export from {source.name if source else 'the original video'}: "
+                    f"{sum(durations) / 1000:.2f}s at original resolution {audio_text}. "
+                    "The timeline maps directly to the source; no GIF or proxy-frame conversion is used."
+                )
+            elif self.suffix in {".mp4", ".webm"}:
+                audio_text = (
+                    "The matching source-audio segment will be attached after rendering."
+                    if self.preserve_audio.isChecked()
+                    else "The export will be silent."
+                )
+                self.summary.setText(
+                    f"Rendered video export: {len(frames):,} editable proxy frames · {target:.2f}s. "
+                    f"Frames encode straight to video; {audio_text}"
+                )
+            else:
+                self.summary.setText(
+                    f"Export selection: {len(frames):,} frames · source {sum(durations) / 1000:.2f}s · "
+                    f"output {target:.2f}s."
+                )
+        except Exception as exc:
+            self.summary.setText(str(exc))
+
+    def options(self) -> dict[str, object]:
+        clip_ms = self.timeline.out_ms - self.timeline.in_ms
+        return {
+            "start_ms": self.timeline.in_ms,
+            "duration_ms": clip_ms,
+            "output_duration_ms": round(self.output_seconds.value() * 1000 / 10) * 10 if self.suffix == ".gif" else clip_ms,
+            "gif_colors": self.gif_colors.value(),
+            "gif_dither": self.gif_dither.isChecked(),
+            "gif_optimize": self.gif_optimize.isChecked(),
+            "fps": self.video_fps.value(),
+            "bitrate_kbps": self.video_bitrate.value(),
+            "direct_video": self.direct_video.isChecked() and self.direct_video.isEnabled(),
+            "preserve_audio": self.preserve_audio.isChecked() and self.preserve_audio.isEnabled(),
+        }
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        self._stop_preview()
+        super().done(result)
 
 
 class EditorWorkspace(QWidget):
@@ -94,7 +761,7 @@ class EditorWorkspace(QWidget):
         "Thermal Map", "Photocopy", "ASCII Art", "Blueprint", "Neon Edges",
         "Topographic Lines",
     ]
-    EFFECT_PARAMETER_KEYS = ("amount", "size", "softness", "detail", "angle", "edge")
+    EFFECT_PARAMETER_KEYS = ("amount", "size", "softness", "detail", "angle", "edge", "phase")
     # Each effect owns its parameter meanings. Irrelevant sliders are hidden,
     # never left disabled in the UI. Tuple: label, minimum, maximum, default, suffix.
     EFFECT_PARAMETERS = {
@@ -269,8 +936,9 @@ class EditorWorkspace(QWidget):
             "size": ("Cell size", 5, 28, 10, " px"),
             "softness": ("Contrast", 0, 100, 58, "%"),
             "detail": ("Charset density", 0, 100, 62, "%"),
-            "angle": ("Color amount", 0, 100, 30, "%"),
+            "angle": ("Color preservation", 0, 100, 72, "%"),
             "edge": ("Contour strength", 0, 100, 76, "%"),
+            "phase": ("Tone polarity", 0, 100, 0, "%"),
         },
         "Blueprint": {
             "amount": ("Mix", 0, 100, 100, "%"),
@@ -324,7 +992,7 @@ class EditorWorkspace(QWidget):
         "Comic Cutout": "Posterized color with adjustable ink edges and saturation.",
         "Thermal Map": "False-color mapping with palette shift and edge-detail control.",
         "Photocopy": "High-contrast copier texture with grain, threshold, edges, and ink spread.",
-        "ASCII Art": "Character art with luminance shading, source-aware color, and edge-oriented contour glyphs.",
+        "ASCII Art": "Font-calibrated character art with a rich luminance ramp, hue-preserving color, adjustable dark-to-light density polarity, stable RGB precision, and contours that detect brightness and color boundaries.",
         "Blueprint": "White/cyan technical drawing lines over a classic blueprint grid.",
         "Neon Edges": "Glowing edge extraction on a dark background with adjustable hue.",
         "Topographic Lines": "Contour-line stylization that resembles a printed terrain map.",
@@ -411,6 +1079,9 @@ class EditorWorkspace(QWidget):
         self._gif_preview_index = 0
         self._gif_playback_started = 0.0
         self._gif_frame_ends: list[int] = []
+        self._gif_frame_ends_key: Optional[tuple[str, int, int, int]] = None
+        self._animation_frame_starts: list[int] = []
+        self._animation_frame_starts_key: Optional[tuple[str, int, int]] = None
         self._gif_source_cache: OrderedDict[tuple[str, int, int, int, int], tuple[Image.Image, float, float, int]] = OrderedDict()
         self._gif_source_cache_bytes = 0
         self._animation_controls_updating = False
@@ -511,8 +1182,13 @@ class EditorWorkspace(QWidget):
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
+        self.editor_splitter = QSplitter(Qt.Horizontal)
+        self.editor_splitter.setChildrenCollapsible(False)
+        self.editor_splitter.setHandleWidth(6)
         sidebar = QFrame(objectName="SideBar")
-        sidebar.setFixedWidth(360)
+        sidebar.setMinimumWidth(280)
+        sidebar.setMaximumWidth(720)
+        self.sidebar = sidebar
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(8, 10, 8, 8)
         title_row = QHBoxLayout()
@@ -534,7 +1210,7 @@ class EditorWorkspace(QWidget):
         self.tool_tabs.addTab(self._build_transform_tab(), "Transform")
         self.tool_tabs.currentChanged.connect(self._tool_tab_changed)
         sidebar_layout.addWidget(self.tool_tabs, 1)
-        body.addWidget(sidebar)
+        self.editor_splitter.addWidget(sidebar)
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
@@ -564,8 +1240,9 @@ class EditorWorkspace(QWidget):
         self.anim_scrub = QSlider(Qt.Horizontal)
         self.anim_scrub.setRange(1, 1)
         self.anim_scrub.setVisible(False)
-        self.anim_scrub.setMaximumWidth(220)
-        self.anim_scrub.setToolTip("Scrub through animation frames")
+        self.anim_scrub.setMinimumWidth(240)
+        self.anim_scrub.setMaximumWidth(520)
+        self.anim_scrub.setToolTip("Scrub through the video/animation timeline")
         self.anim_scrub.valueChanged.connect(self._scrub_animation_frame)
         nav_row.addWidget(self.anim_scrub)
         self.anim_next_button = QToolButton()
@@ -608,7 +1285,11 @@ class EditorWorkspace(QWidget):
         self.coordinate_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         nav_row.addWidget(self.coordinate_label)
         center_layout.addWidget(nav_bar)
-        body.addWidget(center, 1)
+        self.editor_splitter.addWidget(center)
+        self.editor_splitter.setStretchFactor(0, 0)
+        self.editor_splitter.setStretchFactor(1, 1)
+        self.editor_splitter.setSizes([360, 1140])
+        body.addWidget(self.editor_splitter)
         root.addLayout(body, 1)
         self._set_advanced_visible(False)
 
@@ -1109,7 +1790,8 @@ class EditorWorkspace(QWidget):
         self.transform_combo = QComboBox()
         self.transform_combo.addItems([
             "Crop to selection", "Resize…", "Rotate…", "Flip horizontal",
-            "Flip vertical", "Add cinematic bars", "Reset to original",
+            "Flip vertical", "Add cinematic bars", "Extend animation duration…",
+            "Reset to original",
         ])
         layout.addWidget(self.transform_combo)
         self.transform_apply = QPushButton("Run transform", objectName="Accent")
@@ -1178,6 +1860,8 @@ class EditorWorkspace(QWidget):
             self._commit_transform(ImageOps.flip, "Flipped vertically", clear_masks=True)
         elif name == "Add cinematic bars":
             self.cinematic_bars()
+        elif name == "Extend animation duration…":
+            self.extend_animation_duration()
         elif name == "Reset to original":
             self.reset_original()
 
@@ -1406,6 +2090,42 @@ class EditorWorkspace(QWidget):
         names, _ = QFileDialog.getOpenFileNames(self, "Open images", "", IMAGE_FILE_FILTER)
         self.load_paths([Path(n) for n in names])
 
+    def _video_import_options(self, path: Path) -> Optional[dict[str, object]]:
+        try:
+            info = probe_video(path)
+        except Exception as exc:
+            show_operation_error(self, "Open video", "The video metadata could not be read.", str(exc))
+            return None
+        dialog = VideoImportDialog(path, info, self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.options()
+
+    def _read_editor_path(self, path: Path) -> Optional[Image.Image]:
+        if path.suffix.lower() not in {".mp4", ".webm"}:
+            return read_image(path)
+        options = self._video_import_options(path)
+        if options is None:
+            return None
+        progress_dialog = QProgressDialog("Streaming the selected video segment…", "Cancel", 0, 100, self)
+        progress_dialog.setWindowTitle("Import video")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(250)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setMinimumWidth(460)
+
+        def update_progress(done: int, total: int) -> bool:
+            progress_dialog.setMaximum(max(1, total))
+            progress_dialog.setValue(min(done, max(1, total)))
+            QApplication.processEvents()
+            return not progress_dialog.wasCanceled()
+
+        try:
+            return read_image(path, video_options=options, progress=update_progress)
+        finally:
+            progress_dialog.close()
+
     def load_paths(self, paths: list[Path]) -> None:
         failures: list[str] = []
         existing: dict[Path, int] = {}
@@ -1427,10 +2147,15 @@ class EditorWorkspace(QWidget):
                 self._status(f"Already open: {path.name}")
                 continue
             try:
-                self.add_document(read_image(path), path)
+                image = self._read_editor_path(path)
+                if image is None:
+                    continue
+                self.add_document(image, path, consume=True)
                 existing[resolved] = len(self.documents) - 1
                 opened += 1
                 opened_paths.append(str(path))
+            except AnimationReadCancelled:
+                self._status(f"Cancelled video import: {path.name}")
             except Exception as exc:
                 failures.append(f"{path.name}: {exc}")
         if opened_paths:
@@ -1470,8 +2195,32 @@ class EditorWorkspace(QWidget):
             self.gif_play_button.setChecked(False)
             self.gif_play_button.setText("▶ Play animation live")
 
-    def add_document(self, image: Image.Image, path: Optional[Path] = None, dirty: bool = False) -> None:
-        doc = ImageDocument.from_image(image, path)
+    def add_document(
+        self,
+        image: Image.Image,
+        path: Optional[Path] = None,
+        dirty: bool = False,
+        *,
+        consume: bool = False,
+    ) -> None:
+        raw_frames = image.info.get(ANIMATION_FRAMES_KEY, [])
+        owned_inputs = [image, *(raw_frames if isinstance(raw_frames, list) else [])]
+        try:
+            doc = ImageDocument.from_image(image, path)
+        finally:
+            if consume:
+                # Decoder/clipboard paths transfer ownership to the workspace.
+                # Public callers and tests may still reuse images passed to
+                # add_document(), so consumption must remain explicit.
+                seen: set[int] = set()
+                for source in owned_inputs:
+                    if id(source) in seen:
+                        continue
+                    seen.add(id(source))
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
         doc.max_history = self.history_depth
         doc.max_history_bytes = self.history_memory_mb * 1024 * 1024
         if dirty:
@@ -1483,7 +2232,7 @@ class EditorWorkspace(QWidget):
         if doc.is_animated:
             self._status(
                 f"Opened {path.name if path else 'animation'} — {doc.frame_count} frames, "
-                f"{doc.animation_duration_ms / 1000:.2f}s; press Play animation live to preview effects while it moves"
+                f"{doc.animation_duration_ms / 1000:.2f}s; Play previews edits live, and Save As chooses export range/duration"
             )
         else:
             self._status(f"Opened {path.name if path else 'clipboard image'}")
@@ -1513,13 +2262,31 @@ class EditorWorkspace(QWidget):
         doc = self.document
         if not doc:
             return
-        if doc.path and not doc.dirty:
+        if doc.path and not doc.dirty and doc.path.suffix.lower() not in {".mp4", ".webm"}:
             self.sendToEnhance.emit([str(doc.path)])
             return
         target = self.transfer_dir / f"send_{doc.id}{(doc.path.suffix if doc.path and doc.path.suffix.lower() in {'.gif', '.mp4', '.webm'} else '.gif') if doc.is_animated else '.png'}"
         try:
             if doc.is_animated:
-                save_animation(doc.animation_frames, doc.frame_durations, target, loop=doc.animation_loop)
+                direct_source = doc.direct_video_source if target.suffix.lower() in {".mp4", ".webm"} else None
+                if direct_source is not None:
+                    export_video_segment(
+                        direct_source,
+                        target,
+                        start_ms=doc.direct_video_start_ms,
+                        duration_ms=doc.direct_video_duration_ms or doc.animation_duration_ms,
+                        preserve_audio=True,
+                    )
+                else:
+                    save_animation(
+                        doc.animation_frames,
+                        doc.frame_durations,
+                        target,
+                        loop=doc.animation_loop,
+                        audio_source=doc.source_video if target.suffix.lower() in {".mp4", ".webm"} else None,
+                        audio_start_ms=doc.direct_video_start_ms,
+                        audio_duration_ms=doc.animation_duration_ms,
+                    )
             else:
                 save_image(doc.image, target)
         except Exception as exc:
@@ -1539,7 +2306,7 @@ class EditorWorkspace(QWidget):
         if mime.hasImage():
             qimage = QApplication.clipboard().image().convertToFormat(QImage.Format_RGBA8888)
             image = fromqimage(qimage).convert("RGBA")
-            self.add_document(image, dirty=True)
+            self.add_document(image, dirty=True, consume=True)
             return
         if mime.hasUrls():
             self.load_paths([Path(url.toLocalFile()) for url in mime.urls() if url.isLocalFile()])
@@ -1551,6 +2318,7 @@ class EditorWorkspace(QWidget):
         self._stop_preview_timers()
         self._clear_preview_source_cache()
         self._clear_gif_source_cache()
+        self._clear_animation_timing_cache()
         self._preview_kind = None
         self._requested_preview_kind = None
         if not (0 <= index < len(self.documents)):
@@ -1588,6 +2356,7 @@ class EditorWorkspace(QWidget):
     def close_document(self, index: int) -> None:
         if not (0 <= index < len(self.documents)):
             return
+        requested_active = self.active_index
         doc = self.documents[index]
         if doc.dirty:
             box = QMessageBox(self)
@@ -1605,12 +2374,45 @@ class EditorWorkspace(QWidget):
                 self.save()
                 if doc.dirty:
                     return
+                if requested_active != index and 0 <= requested_active < len(self.documents):
+                    self.document_tabs.setCurrentIndex(requested_active)
+                    self._activate(requested_active)
             elif result == QMessageBox.Discard:
                 self._delete_recovery(doc)
-        del self.documents[index]
+        previous_active = requested_active
+        closing_active = index == previous_active
+        if closing_active:
+            next_index = min(index, len(self.documents) - 2)
+        elif index < previous_active:
+            next_index = previous_active - 1
+        else:
+            next_index = previous_active
+        self._switching = True
+        try:
+            if closing_active:
+                self._stop_gif_preview(clear_canvas=False)
+                self._stop_preview_timers()
+                self._clear_preview_source_cache()
+                self._clear_gif_source_cache()
+                self._clear_animation_timing_cache()
+                # Detach before ImageDocument.close() releases Pillow storage.
+                # QTabBar.removeTab() can repaint or emit currentChanged while
+                # the close is in progress, so the canvas must not retain the
+                # soon-to-be-closed document even briefly.
+                self.canvas.set_document(None)
+                self.active_index = -1
+            del self.documents[index]
+            self.document_tabs.removeTab(index)
+            self.document_tabs.setCurrentIndex(next_index)
+        finally:
+            self._switching = False
         doc.close()
-        self.document_tabs.removeTab(index)
-        self._activate(min(index, len(self.documents) - 1))
+        if closing_active:
+            self._activate(next_index)
+        else:
+            self.active_index = next_index
+            self._update_tab_labels()
+            self._update_button_states()
 
     def save(self) -> bool:
         doc = self.document
@@ -1620,7 +2422,31 @@ class EditorWorkspace(QWidget):
             return self.save_as()
         try:
             if doc.is_animated:
-                save_animation(doc.animation_frames, doc.frame_durations, doc.path, loop=doc.animation_loop)
+                direct_source = doc.direct_video_source if doc.path.suffix.lower() in {".mp4", ".webm"} else None
+                if direct_source is not None:
+                    try:
+                        same_file = direct_source.resolve() == doc.path.resolve()
+                    except OSError:
+                        same_file = direct_source == doc.path
+                    if not same_file:
+                        export_video_segment(
+                            direct_source,
+                            doc.path,
+                            start_ms=doc.direct_video_start_ms,
+                            duration_ms=doc.direct_video_duration_ms or doc.animation_duration_ms,
+                            preserve_audio=True,
+                        )
+                else:
+                    source_video = doc.source_video if doc.path.suffix.lower() in {".mp4", ".webm"} else None
+                    save_animation(
+                        doc.animation_frames,
+                        doc.frame_durations,
+                        doc.path,
+                        loop=doc.animation_loop,
+                        audio_source=source_video,
+                        audio_start_ms=doc.direct_video_start_ms,
+                        audio_duration_ms=doc.animation_duration_ms,
+                    )
             else:
                 save_image(doc.image, doc.path, metadata=doc.metadata if self.preserve_metadata else {})
             doc.mark_saved()
@@ -1650,15 +2476,72 @@ class EditorWorkspace(QWidget):
             QMessageBox.information(self, "Animated export", "Animated documents can be saved as GIF, MP4, or WebM files.")
             return False
         try:
+            customized_export = False
             if doc.is_animated:
-                save_animation(doc.animation_frames, doc.frame_durations, path, loop=doc.animation_loop)
+                export_dialog = AnimationExportDialog(doc, path.suffix, self)
+                if export_dialog.exec() != QDialog.Accepted:
+                    return False
+                options = export_dialog.options()
+                direct_video = bool(options.get("direct_video", False)) and path.suffix.lower() in {".mp4", ".webm"}
+                if direct_video:
+                    direct_source = doc.direct_video_source
+                    if direct_source is None:
+                        raise ValueError("The original video is no longer available for direct export.")
+                    export_video_segment(
+                        direct_source,
+                        path,
+                        start_ms=doc.direct_video_start_ms + int(options["start_ms"]),
+                        duration_ms=int(options["duration_ms"]),
+                        fps=int(options["fps"]),
+                        bitrate_kbps=int(options["bitrate_kbps"]),
+                        preserve_audio=bool(options.get("preserve_audio", True)),
+                    )
+                else:
+                    export_frames, export_durations = slice_animation(
+                        doc.animation_frames,
+                        doc.frame_durations,
+                        start_ms=int(options["start_ms"]),
+                        duration_ms=int(options["duration_ms"]),
+                    )
+                    if path.suffix.lower() == ".gif":
+                        export_durations = retime_animation_durations(
+                            export_durations,
+                            int(options["output_duration_ms"]),
+                        )
+                    save_animation(
+                        export_frames,
+                        export_durations,
+                        path,
+                        loop=doc.animation_loop,
+                        fps=int(options["fps"]),
+                        bitrate_kbps=int(options["bitrate_kbps"]),
+                        gif_colors=int(options["gif_colors"]),
+                        gif_dither=bool(options["gif_dither"]),
+                        gif_optimize=bool(options["gif_optimize"]),
+                        audio_source=(
+                            doc.source_video
+                            if path.suffix.lower() in {".mp4", ".webm"}
+                            and bool(options.get("preserve_audio", False))
+                            else None
+                        ),
+                        audio_start_ms=doc.direct_video_start_ms + int(options["start_ms"]),
+                        audio_duration_ms=int(options["duration_ms"]),
+                    )
+                customized_export = (
+                    int(options["start_ms"]) != 0
+                    or int(options["duration_ms"]) != doc.animation_duration_ms
+                    or int(options["output_duration_ms"]) != doc.animation_duration_ms
+                )
             else:
                 save_image(doc.image, path, metadata=doc.metadata if self.preserve_metadata else {})
-            doc.path = path
-            doc.mark_saved()
-            self._update_tab_labels()
-            self._delete_recovery(doc)
-            self._status(f"Saved {path.name}")
+            if not customized_export:
+                doc.path = path
+                doc.mark_saved()
+                self._update_tab_labels()
+                self._delete_recovery(doc)
+                self._status(f"Saved {path.name}")
+            else:
+                self._status(f"Exported animation clip to {path.name}; the open document was not replaced")
             return True
         except Exception as exc:
             show_operation_error(self, "Save As failed", "The image was not saved. The open document is unchanged.", str(exc))
@@ -1752,6 +2635,10 @@ class EditorWorkspace(QWidget):
         self._update_tab_labels()
         self._clear_preview_source_cache()
         self._clear_gif_source_cache()
+        self._clear_animation_timing_cache()
+        doc = self.document
+        if doc and doc.is_animated and self.anim_scrub.maximum() != doc.frame_count:
+            self._update_animation_tool_availability(doc)
         self.canvas.update()
         self._preview_target_changed()
 
@@ -1825,6 +2712,25 @@ class EditorWorkspace(QWidget):
         end = max(start, min(count - 1, self.anim_loop_end.value() - 1 if hasattr(self, "anim_loop_end") else count - 1))
         return start, end
 
+    def _clear_animation_timing_cache(self) -> None:
+        self._gif_frame_ends.clear()
+        self._gif_frame_ends_key = None
+        self._animation_frame_starts.clear()
+        self._animation_frame_starts_key = None
+
+    def _frame_starts_for(self, doc: ImageDocument) -> list[int]:
+        key = (doc.id, doc.image_revision, doc.frame_count)
+        if key == self._animation_frame_starts_key:
+            return self._animation_frame_starts
+        starts: list[int] = []
+        elapsed = 0
+        for duration in doc.frame_durations:
+            starts.append(elapsed)
+            elapsed += max(10, int(duration or 100))
+        self._animation_frame_starts = starts
+        self._animation_frame_starts_key = key
+        return starts
+
     def _sync_animation_widgets(self, index: int, count: int) -> None:
         self._animation_controls_updating = True
         if hasattr(self, "anim_scrub"):
@@ -1832,7 +2738,13 @@ class EditorWorkspace(QWidget):
         if hasattr(self, "gif_frame_label"):
             start, end = self._current_animation_range()
             loop_text = f" · loop {start + 1}-{end + 1}" if count > 1 and (start != 0 or end != count - 1) else ""
-            self.gif_frame_label.setText(f"Anim {index + 1}/{count}{loop_text}")
+            doc = self.document
+            elapsed_ms = self._frame_starts_for(doc)[index] if doc and doc.is_animated else 0
+            total_ms = doc.animation_duration_ms if doc and doc.is_animated else 0
+            self.gif_frame_label.setText(
+                f"{RangeTimeline._format_ms(elapsed_ms)} / {RangeTimeline._format_ms(total_ms)} · "
+                f"frame {index + 1}/{count}{loop_text}"
+            )
         self._animation_controls_updating = False
 
     def _show_animation_frame(self, index: int, *, update_slider: bool = True) -> None:
@@ -1880,6 +2792,8 @@ class EditorWorkspace(QWidget):
         self.anim_loop_start.setValue(start)
         self.anim_loop_end.setValue(end)
         self._animation_controls_updating = False
+        self._gif_frame_ends.clear()
+        self._gif_frame_ends_key = None
         start_index, end_index = self._current_animation_range(doc)
         if self._gif_preview_index < start_index or self._gif_preview_index > end_index:
             self._show_animation_frame(start_index, update_slider=True)
@@ -1952,6 +2866,7 @@ class EditorWorkspace(QWidget):
         self._gif_preview_timer.stop()
         self._gif_playing = False
         self._gif_frame_ends.clear()
+        self._gif_frame_ends_key = None
         if hasattr(self, "gif_play_button"):
             self.gif_play_button.blockSignals(True)
             self.gif_play_button.setChecked(False)
@@ -2087,21 +3002,27 @@ class EditorWorkspace(QWidget):
             self._stop_gif_preview()
             return
         start, end = self._current_animation_range(doc)
-        durations = [max(10, int(value or 100)) for value in doc.frame_durations[start:end + 1]]
-        if not durations:
-            durations = [100] * max(1, end - start + 1)
-        frame_ends: list[int] = []
-        total = 0
-        for duration in durations:
-            total += duration
-            frame_ends.append(total)
+        timing_key = (doc.id, doc.image_revision, start, end)
+        if timing_key != self._gif_frame_ends_key:
+            frame_ends: list[int] = []
+            total = 0
+            for value in doc.frame_durations[start:end + 1]:
+                total += max(10, int(value or 100))
+                frame_ends.append(total)
+            if not frame_ends:
+                frame_ends = list(range(100, 100 * max(1, end - start + 1) + 1, 100))
+                total = frame_ends[-1]
+            self._gif_frame_ends = frame_ends
+            self._gif_frame_ends_key = timing_key
+        frame_ends = self._gif_frame_ends
+        total = frame_ends[-1] if frame_ends else 100
         elapsed_ms = int((time.perf_counter() - self._gif_playback_started) * 1000) % max(1, total)
-        local_index = min(len(durations) - 1, bisect_right(frame_ends, elapsed_ms))
+        local_index = min(len(frame_ends) - 1, bisect_right(frame_ends, elapsed_ms))
         index = start + local_index
         self._show_animation_frame(index, update_slider=True)
 
         elapsed_after_render = int((time.perf_counter() - self._gif_playback_started) * 1000) % max(1, total)
-        next_local = min(len(durations) - 1, bisect_right(frame_ends, elapsed_after_render))
+        next_local = min(len(frame_ends) - 1, bisect_right(frame_ends, elapsed_after_render))
         next_boundary = frame_ends[next_local]
         delay = next_boundary - elapsed_after_render
         self._gif_preview_timer.start(max(10, int(delay if delay > 0 else 10)))
@@ -2262,7 +3183,7 @@ class EditorWorkspace(QWidget):
         ],
         "ASCII mask": [
             {"name": "Privacy Blur", "amount": 36, "size": 14, "softness": 62, "detail": 0},
-            {"name": "ASCII Art", "amount": 100, "size": 9, "softness": 66, "detail": 76, "angle": 24, "edge": 84},
+            {"name": "ASCII Art", "amount": 100, "size": 9, "softness": 66, "detail": 76, "angle": 72, "edge": 84, "phase": 0},
         ],
         "Blueprint concealment": [
             {"name": "Blueprint", "amount": 100, "size": 22, "softness": 16, "detail": 76, "angle": 34},
@@ -2583,6 +3504,7 @@ class EditorWorkspace(QWidget):
         detail = int(spec["detail"])
         angle = int(spec["angle"])
         edge = int(spec["edge"])
+        phase = int(spec["phase"])
         if name == "Soft Blur":
             return lambda im: effects.privacy_blur(im, size, softness // 3, detail, amount, scale=scale)
         if name == "Privacy Blur":
@@ -2632,7 +3554,7 @@ class EditorWorkspace(QWidget):
         if name == "Photocopy":
             return lambda im: effects.photocopy_redaction(im, amount, size, softness, detail, angle)
         if name == "ASCII Art":
-            return lambda im: effects.ascii_art_tuned(im, amount, max(5, round(size * scale)), softness, detail, angle, edge)
+            return lambda im: effects.ascii_art_tuned(im, amount, max(5, round(size * scale)), softness, detail, angle, edge, phase)
         if name == "Blueprint":
             return lambda im: effects.blueprint_tuned(im, amount, max(8, round(size * scale)), softness, detail, angle)
         if name == "Neon Edges":
@@ -3803,6 +4725,68 @@ class EditorWorkspace(QWidget):
         if self._apply_document_transform(add_bars, label="Adding cinematic bars"):
             self._document_changed()
 
+    def extend_animation_duration(self) -> None:
+        doc = self.document
+        if not doc or not doc.is_animated:
+            QMessageBox.information(
+                self,
+                "Extend animation",
+                "Open an animated GIF, MP4, or WebM file first.",
+            )
+            return
+
+        current_seconds = doc.animation_duration_ms / 1000
+        maximum_seconds = 1_000_000_000.0
+
+        target_seconds, accepted = QInputDialog.getDouble(
+            self,
+            "Extend animation duration",
+            f"New total duration in seconds\nCurrent duration: {current_seconds:.2f}s",
+            current_seconds + max(1.0, current_seconds),
+            current_seconds + 0.01,
+            maximum_seconds,
+            2,
+        )
+        if not accepted:
+            return
+
+        start, end = self._current_animation_range(doc)
+        custom_range = start != 0 or end != doc.frame_count - 1
+        repeat_label = "Repeat current preview loop" if custom_range else "Repeat full animation"
+        mode_label, accepted = QInputDialog.getItem(
+            self,
+            "Extend animation duration",
+            "Fill the added time with:",
+            [repeat_label, "Hold final frame"],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+
+        self._stop_gif_preview(clear_canvas=False)
+        try:
+            added_frames = doc.extend_animation(
+                round(target_seconds * 1000),
+                mode="hold" if mode_label == "Hold final frame" else "repeat",
+                range_start=start,
+                range_end=end,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Extend animation", str(exc))
+            return
+
+        self.cancel_preview(False)
+        self._gif_preview_index = min(self._gif_preview_index, doc.frame_count - 1)
+        self._document_changed()
+        method = "held the final frame" if mode_label == "Hold final frame" else (
+            f"repeated frames {start + 1}-{end + 1}"
+        )
+        frame_note = "" if added_frames == 0 else f", added {added_frames} frames"
+        self._status(
+            f"Extended animation to {doc.animation_duration_ms / 1000:.2f}s — {method}{frame_note}"
+        )
+
     def reset_original(self) -> None:
         if self.document:
             self.document.reset()
@@ -3810,7 +4794,7 @@ class EditorWorkspace(QWidget):
 
     @staticmethod
     def _write_recovery(
-        image: Image.Image,
+        image: Image.Image | None,
         image_path: Path,
         meta_path: Path,
         payload: dict[str, object],
@@ -3818,11 +4802,29 @@ class EditorWorkspace(QWidget):
         frame_durations: Optional[list[int]] = None,
         animation_loop: int = 0,
     ) -> None:
-        if animation_frames:
-            save_animation(animation_frames, frame_durations or [100] * len(animation_frames), image_path, loop=animation_loop)
-        else:
-            save_image(image, image_path, optimize=False)
-        atomic_write_text(meta_path, json.dumps(payload))
+        try:
+            # Pillow's native encoders are not consistently safe when several
+            # editor instances finish recovery files at the same time. Keep
+            # recovery encoding serialized while snapshots remain independent.
+            with _RECOVERY_SAVE_LOCK:
+                if animation_frames:
+                    save_animation(animation_frames, frame_durations or [100] * len(animation_frames), image_path, loop=animation_loop)
+                elif image is not None:
+                    save_image(image, image_path, optimize=False)
+                else:
+                    raise ValueError("Recovery snapshot contains no image data.")
+                atomic_write_text(meta_path, json.dumps(payload))
+        finally:
+            owned = ([image] if image is not None else []) + list(animation_frames or [])
+            seen: set[int] = set()
+            for frame in owned:
+                if id(frame) in seen:
+                    continue
+                seen.add(id(frame))
+                try:
+                    frame.close()
+                except Exception:
+                    pass
 
     def _autosave(self) -> None:
         if self._finalized:
@@ -3848,13 +4850,15 @@ class EditorWorkspace(QWidget):
                 "frames": doc.frame_count,
                 "duration_ms": doc.animation_duration_ms,
             }
+            animation_snapshot = [frame.copy() for frame in doc.animation_frames] if doc.is_animated else None
+            still_snapshot = None if animation_snapshot else doc.image.copy()
             future = self._recovery_executor.submit(
                 self._write_recovery,
-                doc.image.copy(),
+                still_snapshot,
                 image_path,
                 meta_path,
                 payload,
-                list(doc.animation_frames) if doc.is_animated else None,
+                animation_snapshot,
                 list(doc.frame_durations) if doc.is_animated else None,
                 doc.animation_loop,
             )
@@ -3906,7 +4910,10 @@ class EditorWorkspace(QWidget):
 
     def _cleanup_transfers(self) -> None:
         cutoff = time.time() - 7 * 24 * 60 * 60
-        for path in list(self.transfer_dir.glob("send_*.png")) + list(self.transfer_dir.glob("send_*.gif")):
+        paths: list[Path] = []
+        for suffix in ("png", "gif", "mp4", "webm"):
+            paths.extend(self.transfer_dir.glob(f"send_*.{suffix}"))
+        for path in paths:
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink(missing_ok=True)
@@ -3950,7 +4957,7 @@ class EditorWorkspace(QWidget):
                             raise ValueError("Recovery metadata is not an object")
                         meta = loaded
                     source = Path(str(meta["path"])) if meta.get("path") else None
-                    self.add_document(read_image(image_path), source, dirty=True)
+                    self.add_document(read_image(image_path), source, dirty=True, consume=True)
                     # Keep the recovered identity until the user saves or discards it.
                     # An immediate second crash must not lose the only recovery copy.
                     doc = self.documents[-1]
@@ -4039,10 +5046,19 @@ class EditorWorkspace(QWidget):
         self._stop_preview_timers()
         self._clear_preview_source_cache()
         self._clear_gif_source_cache()
-        self._recovery_executor.shutdown(wait=False, cancel_futures=True)
+        self._recovery_executor.shutdown(wait=True, cancel_futures=True)
+        self.canvas.set_document(None)
         for doc in self.documents:
             doc.close()
         self.documents.clear()
+
+    def close(self) -> bool:  # type: ignore[override]
+        # Qt does not always deliver closeEvent() for a widget that has never
+        # been shown (common in embedding, tests, and cancelled startup). Make
+        # cleanup deterministic so timers and Pillow buffers cannot survive and
+        # affect a later editor instance.
+        self.finalize_close()
+        return super().close()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         # EditorWorkspace is also used independently in tests and embedding.

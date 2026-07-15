@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 from typing import Optional
 
@@ -45,8 +46,11 @@ class ImageCanvas(QWidget):
         self.shape_color = "#ff3030"
         self._preview_image: Optional[Image.Image] = None
         self._animation_original_image: Optional[Image.Image] = None
-        self._pixmap_cache_key: Optional[tuple[int, int, int, str]] = None
-        self._pixmap_cache: QPixmap = QPixmap()
+        self._pixmap_cache: OrderedDict[tuple[int, int, int, str], QPixmap] = OrderedDict()
+        self._brush_mask_size = 0
+        self._brush_mask_hard: Optional[Image.Image] = None
+        self._brush_mask_soft: Optional[Image.Image] = None
+        self._brush_black_patch: Optional[Image.Image] = None
         self.show_original = False
         self.before_hold_previous = False
         self.compare_enabled = False
@@ -96,13 +100,12 @@ class ImageCanvas(QWidget):
 
     def _reset_interaction_state(self) -> None:
         """Drop transient mouse state when tabs/documents change mid-gesture."""
+        self._rollback_incomplete_brush()
         self.drag_start = None
         self.drag_current = None
         self.dragging = False
         self.panning = False
         self.space_pan_active = False
-        self.brush_before = None
-        self.brush_source = None
         self.clone_offset = None
         self.mask_drag_kind = None
         self.mask_drag_index = None
@@ -157,6 +160,8 @@ class ImageCanvas(QWidget):
     def preview_image(self, image: Optional[Image.Image]) -> None:
         previous = self._preview_image
         self._preview_image = image
+        if previous is not image:
+            self._discard_pixmap(previous)
         if previous is not None and previous is not image:
             protected = {id(self._animation_original_image)}
             if self.document is not None:
@@ -169,7 +174,6 @@ class ImageCanvas(QWidget):
                     previous.close()
                 except Exception:
                     pass
-        self._invalidate_pixmap_cache()
 
     @property
     def animation_original_image(self) -> Optional[Image.Image]:
@@ -177,12 +181,72 @@ class ImageCanvas(QWidget):
 
     @animation_original_image.setter
     def animation_original_image(self, image: Optional[Image.Image]) -> None:
+        if self._animation_original_image is not image:
+            self._discard_pixmap(self._animation_original_image)
         self._animation_original_image = image
-        self._invalidate_pixmap_cache()
 
     def _invalidate_pixmap_cache(self) -> None:
-        self._pixmap_cache_key = None
-        self._pixmap_cache = QPixmap()
+        self._pixmap_cache.clear()
+
+    def _discard_pixmap(self, image: Optional[Image.Image]) -> None:
+        if image is None:
+            return
+        image_id = id(image)
+        for key in [key for key in self._pixmap_cache if key[0] == image_id]:
+            del self._pixmap_cache[key]
+
+    def _close_brush_masks(self) -> None:
+        for image in (self._brush_mask_hard, self._brush_mask_soft, self._brush_black_patch):
+            if image is not None:
+                image.close()
+        self._brush_mask_hard = None
+        self._brush_mask_soft = None
+        self._brush_black_patch = None
+        self._brush_mask_size = 0
+
+    def _full_brush_mask(self, softened: bool = False) -> Image.Image:
+        size = max(2, int(self.brush_size))
+        if self._brush_mask_hard is None or self._brush_mask_size != size:
+            self._close_brush_masks()
+            radius = max(2, size // 2)
+            diameter = radius * 2 + 1
+            hard = Image.new("L", (diameter, diameter), 0)
+            ImageDraw.Draw(hard).ellipse((0, 0, diameter - 1, diameter - 1), fill=255)
+            self._brush_mask_hard = hard
+            self._brush_mask_size = size
+        if softened and self._brush_mask_soft is None:
+            assert self._brush_mask_hard is not None
+            self._brush_mask_soft = self._brush_mask_hard.filter(
+                ImageFilter.GaussianBlur(max(1, size / 8))
+            )
+        mask = self._brush_mask_soft if softened else self._brush_mask_hard
+        assert mask is not None
+        return mask
+
+    def _full_black_brush_patch(self) -> Image.Image:
+        hard_mask = self._full_brush_mask(False)
+        if self._brush_black_patch is None:
+            self._brush_black_patch = Image.new("RGBA", hard_mask.size, (0, 0, 0, 255))
+        return self._brush_black_patch
+
+    def _rollback_incomplete_brush(self) -> None:
+        """Restore an uncommitted in-place stroke when its document is left."""
+        before = self.brush_before
+        source = self.brush_source
+        document = self.document
+        if before is not None:
+            if document is not None:
+                modified = document.image
+                document.image = before
+                if modified is not before:
+                    modified.close()
+                self._invalidate_pixmap_cache()
+            else:
+                before.close()
+        if source is not None and source is not before:
+            source.close()
+        self.brush_before = None
+        self.brush_source = None
 
     def _text_handle_hit(self, point: QPointF) -> Optional[str]:
         if not self.text_overlay_box:
@@ -262,11 +326,22 @@ class ImageCanvas(QWidget):
 
     def _pixmap(self, image: Image.Image) -> QPixmap:
         key = (id(image), image.width, image.height, image.mode)
-        if key != self._pixmap_cache_key or self._pixmap_cache.isNull():
-            qimage = QImage(ImageQt(image.convert("RGBA")))
-            self._pixmap_cache = QPixmap.fromImage(qimage)
-            self._pixmap_cache_key = key
-        return self._pixmap_cache
+        cached = self._pixmap_cache.get(key)
+        if cached is not None and not cached.isNull():
+            self._pixmap_cache.move_to_end(key)
+            return cached
+        converted = image if image.mode == "RGBA" else image.convert("RGBA")
+        try:
+            qimage = QImage(ImageQt(converted)).copy()
+        finally:
+            if converted is not image:
+                converted.close()
+        pixmap = QPixmap.fromImage(qimage)
+        self._pixmap_cache[key] = pixmap
+        self._pixmap_cache.move_to_end(key)
+        while len(self._pixmap_cache) > 2:
+            self._pixmap_cache.popitem(last=False)
+        return pixmap
 
     def _calculate_image_rect(self, image: Image.Image) -> QRectF:
         if self.fit_mode:
@@ -798,39 +873,71 @@ class ImageCanvas(QWidget):
         assert self.document
         radius = max(2, self.brush_size // 2)
         x, y = point
-        box = (max(0, x - radius), max(0, y - radius), min(self.document.image.width, x + radius + 1), min(self.document.image.height, y + radius + 1))
+        raw_left, raw_top = x - radius, y - radius
+        box = (max(0, raw_left), max(0, raw_top), min(self.document.image.width, x + radius + 1), min(self.document.image.height, y + radius + 1))
         if box[2] <= box[0] or box[3] <= box[1]:
             return
-        mask = Image.new("L", (box[2] - box[0], box[3] - box[1]), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, mask.width - 1, mask.height - 1), fill=255)
-        destination = self.document.image.crop(box)
+        full_mask = self._full_brush_mask(self.mode == "heal")
         if self.mode == "brush_black":
-            patch = Image.new("RGBA", destination.size, (0, 0, 0, 255))
-        elif self.mode in {"clone", "heal"} and self.brush_source and self.clone_offset:
-            ox, oy = self.clone_offset
-            source_box = (box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy)
-            patch = destination.copy()
-            valid = (max(0, source_box[0]), max(0, source_box[1]), min(self.brush_source.width, source_box[2]), min(self.brush_source.height, source_box[3]))
-            if valid[2] <= valid[0] or valid[3] <= valid[1]:
-                return
-            crop = self.brush_source.crop(valid)
-            patch.paste(crop, (valid[0] - source_box[0], valid[1] - source_box[1]))
-            if self.mode == "heal":
-                patch = Image.blend(destination, patch, 0.68)
-                mask = mask.filter(ImageFilter.GaussianBlur(max(1, self.brush_size / 8)))
-        elif self.brush_source:
-            patch = self.brush_source.crop(box)
-        else:
+            self.document.image.paste(self._full_black_brush_patch(), (raw_left, raw_top), full_mask)
+            self._invalidate_pixmap_cache()
             return
-        self.document.image.paste(patch, (box[0], box[1]), mask)
+        full_box = (raw_left, raw_top, x + radius + 1, y + radius + 1)
+        mask_is_crop = box != full_box
+        mask = (
+            full_mask.crop((box[0] - raw_left, box[1] - raw_top, box[2] - raw_left, box[3] - raw_top))
+            if mask_is_crop
+            else full_mask
+        )
+        try:
+            if self.mode in {"clone", "heal"} and self.brush_source and self.clone_offset:
+                destination = self.document.image.crop(box)
+                patch = destination.copy()
+                try:
+                    ox, oy = self.clone_offset
+                    source_box = (box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy)
+                    valid = (
+                        max(0, source_box[0]), max(0, source_box[1]),
+                        min(self.brush_source.width, source_box[2]), min(self.brush_source.height, source_box[3]),
+                    )
+                    if valid[2] <= valid[0] or valid[3] <= valid[1]:
+                        return
+                    crop = self.brush_source.crop(valid)
+                    try:
+                        patch.paste(crop, (valid[0] - source_box[0], valid[1] - source_box[1]))
+                    finally:
+                        crop.close()
+                    if self.mode == "heal":
+                        healed = Image.blend(destination, patch, 0.68)
+                        patch.close()
+                        patch = healed
+                    self.document.image.paste(patch, (box[0], box[1]), mask)
+                finally:
+                    patch.close()
+                    destination.close()
+            elif self.brush_source:
+                patch = self.brush_source.crop(box)
+                try:
+                    self.document.image.paste(patch, (box[0], box[1]), mask)
+                finally:
+                    patch.close()
+            else:
+                return
+        finally:
+            if mask_is_crop:
+                mask.close()
         self._invalidate_pixmap_cache()
 
     def _finish_brush(self) -> None:
         if not self.document or self.brush_before is None:
             return
-        self.document.commit_in_place(self.brush_before)
+        before = self.brush_before
+        source = self.brush_source
+        self.document.commit_in_place(before)
         self._invalidate_pixmap_cache()
         self.brush_before = self.brush_source = None
+        if source is not None and source is not before:
+            source.close()
         self.documentChanged.emit()
         self.statusChanged.emit("Brush stroke applied")
         self.update()

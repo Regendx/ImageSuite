@@ -8,7 +8,13 @@ import uuid
 
 from PIL import Image
 
-from imagesuite.utils import available_memory_bytes
+from imagesuite.utils import (
+    HARD_ANIMATION_FRAMES,
+    VIDEO_SOURCE_DURATION_MS_KEY,
+    VIDEO_SOURCE_PATH_KEY,
+    VIDEO_SOURCE_START_MS_KEY,
+    available_memory_bytes,
+)
 
 
 ANIMATION_FRAMES_KEY = "_imagesuite_animation_frames"
@@ -204,8 +210,14 @@ class ImageDocument:
                 path=path,
                 metadata={
                     key: image.info[key]
-                    for key in ("icc_profile", "dpi")
-                    if key in image.info and image.info[key]
+                    for key in (
+                        "icc_profile",
+                        "dpi",
+                        VIDEO_SOURCE_PATH_KEY,
+                        VIDEO_SOURCE_START_MS_KEY,
+                        VIDEO_SOURCE_DURATION_MS_KEY,
+                    )
+                    if key in image.info and image.info[key] is not None
                 },
                 animation_frames=animation_frames,
                 original_animation_frames=originals,
@@ -233,6 +245,35 @@ class ImageDocument:
     @property
     def animation_duration_ms(self) -> int:
         return sum(self.frame_durations) if self.is_animated else 0
+
+    @property
+    def direct_video_source(self) -> Optional[Path]:
+        source = self.source_video
+        if source is None or self.image_revision != 0:
+            return None
+        return source
+
+    @property
+    def source_video(self) -> Optional[Path]:
+        """Return the imported source video even after pixel edits.
+
+        Direct video export requires revision zero, but source audio can still
+        be remuxed onto a rendered edited video. Keeping those capabilities
+        separate avoids disabling audio preservation after the first edit.
+        """
+        raw = self.metadata.get(VIDEO_SOURCE_PATH_KEY)
+        if not raw or not self.is_animated:
+            return None
+        source = Path(str(raw))
+        return source if source.suffix.lower() in {".mp4", ".webm"} and source.exists() else None
+
+    @property
+    def direct_video_start_ms(self) -> int:
+        return max(0, int(self.metadata.get(VIDEO_SOURCE_START_MS_KEY, 0) or 0))
+
+    @property
+    def direct_video_duration_ms(self) -> int:
+        return max(0, int(self.metadata.get(VIDEO_SOURCE_DURATION_MS_KEY, self.animation_duration_ms) or 0))
 
     def frames(self) -> list[Image.Image]:
         return self.animation_frames if self.is_animated else [self.image]
@@ -348,7 +389,12 @@ class ImageDocument:
             raise ValueError("An animation must contain at least one frame.")
         normalized: list[Image.Image] = []
         for frame in frames:
-            normalized.append(frame if frame.mode == "RGBA" else frame.convert("RGBA"))
+            if frame.mode == "RGBA":
+                normalized.append(frame)
+            else:
+                converted = frame.convert("RGBA")
+                frame.close()
+                normalized.append(converted)
         duration_values = [max(10, int(value or 100)) for value in (durations or self.frame_durations)]
         if len(normalized) > 1 and len(duration_values) != len(normalized):
             duration_values = [100] * len(normalized)
@@ -366,6 +412,126 @@ class ImageDocument:
             self.lasso_points.clear()
         else:
             self._scale_geometry(*geometry_scale)
+
+    def extend_animation(
+        self,
+        target_duration_ms: int,
+        *,
+        mode: str = "repeat",
+        range_start: int = 0,
+        range_end: int | None = None,
+        max_frames: int = HARD_ANIMATION_FRAMES,
+    ) -> int:
+        """Extend an animation to an exact duration and return added frames.
+
+        ``repeat`` appends the selected frame range until the requested duration
+        is reached. ``hold`` keeps the frame count unchanged and lengthens the
+        final frame. The operation commits through normal document history, so
+        Undo/Redo and recovery keep working without a second animation model.
+        """
+        if not self.is_animated:
+            raise ValueError("Only animated documents can be extended.")
+
+        target = int(target_duration_ms)
+        current = self.animation_duration_ms
+        if target <= current:
+            raise ValueError("The new duration must be longer than the current animation.")
+
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in {"repeat", "hold"}:
+            raise ValueError(f"Unsupported animation extension mode: {mode}")
+
+        source_frames = list(self.animation_frames)
+        source_durations = [max(10, int(value or 100)) for value in self.frame_durations]
+        extra = target - current
+
+        if normalized_mode == "hold":
+            new_frames = [frame.copy() for frame in source_frames]
+            try:
+                new_durations = list(source_durations)
+                new_durations[-1] += extra
+                self.commit_frames(new_frames, durations=new_durations)
+                return 0
+            except Exception:
+                for frame in new_frames:
+                    try:
+                        frame.close()
+                    except Exception:
+                        pass
+                raise
+
+        start = max(0, min(len(source_frames) - 1, int(range_start)))
+        end_value = len(source_frames) - 1 if range_end is None else int(range_end)
+        end = max(start, min(len(source_frames) - 1, end_value))
+        cycle_frames = source_frames[start:end + 1]
+        cycle_durations = source_durations[start:end + 1]
+        cycle_ms = sum(cycle_durations)
+        if not cycle_frames or cycle_ms <= 0:
+            raise ValueError("The selected animation range is empty.")
+
+        full_cycles, remainder = divmod(extra, cycle_ms)
+        additional_count = full_cycles * len(cycle_frames)
+        remaining_for_count = remainder
+        if remaining_for_count:
+            for duration in cycle_durations:
+                if remaining_for_count < 10:
+                    break
+                additional_count += 1
+                remaining_for_count -= min(duration, remaining_for_count)
+                if remaining_for_count <= 0:
+                    break
+
+        output_count = len(source_frames) + additional_count
+        pixel_budget_frames = max(
+            len(source_frames),
+            animation_edit_budget_pixels() // max(1, self.image.width * self.image.height),
+        )
+        safe_frame_limit = max(len(source_frames), min(max_frames, pixel_budget_frames))
+        if output_count > safe_frame_limit:
+            max_repeat_seconds = current / 1000 + (
+                max(0, safe_frame_limit - len(source_frames)) * cycle_ms
+                / max(1, len(cycle_frames))
+                / 1000
+            )
+            raise ValueError(
+                f"That extension would create {output_count:,} editable frames. "
+                f"This document is currently limited to about {safe_frame_limit:,} frames "
+                f"({max_repeat_seconds:.1f}s with this loop). Use Hold final frame, "
+                "shorten the target, or lower the animation resolution first."
+            )
+
+        new_frames: list[Image.Image] = []
+        try:
+            new_frames.extend(frame.copy() for frame in source_frames)
+            new_durations = list(source_durations)
+            for _ in range(full_cycles):
+                new_frames.extend(frame.copy() for frame in cycle_frames)
+                new_durations.extend(cycle_durations)
+
+            remaining = remainder
+            for frame, duration in zip(cycle_frames, cycle_durations):
+                if remaining <= 0:
+                    break
+                # GIF timing is stored in 10 ms units. Avoid creating a frame
+                # that commit_frames would round up and make the result longer.
+                if remaining < 10:
+                    new_durations[-1] += remaining
+                    remaining = 0
+                    break
+                frame_duration = min(duration, remaining)
+                new_frames.append(frame.copy())
+                new_durations.append(frame_duration)
+                remaining -= frame_duration
+
+            self.commit_frames(new_frames, durations=new_durations)
+            return len(new_frames) - len(source_frames)
+        except Exception:
+            for frame in new_frames:
+                try:
+                    frame.close()
+                except Exception:
+                    pass
+            raise
 
     @staticmethod
     def _transform_owned(frame: Image.Image, transform: Callable[[Image.Image], Image.Image]) -> Image.Image:
@@ -411,7 +577,7 @@ class ImageDocument:
         budget_pixels: int | None = None,
     ) -> AnimationEditSummary | None:
         if not self.is_animated:
-            self.commit(transform(self.image.copy()), clear_masks=clear_masks)
+            self.commit(self._transform_owned(self.image, transform), clear_masks=clear_masks)
             return None
 
         source_frames = list(self.animation_frames)
@@ -491,7 +657,11 @@ class ImageDocument:
     def commit(self, image: Image.Image, *, clear_masks: bool = False) -> None:
         if self.is_animated:
             raise RuntimeError("Animated edits must be applied to every frame.")
-        normalized = image if image.mode == "RGBA" else image.convert("RGBA")
+        if image.mode == "RGBA":
+            normalized = image
+        else:
+            normalized = image.convert("RGBA")
+            image.close()
         self._push_history(self._take_state())
         self.image = normalized
         self.animation_frames = []

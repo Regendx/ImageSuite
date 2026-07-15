@@ -4,8 +4,8 @@ from pathlib import Path
 import os
 import sys
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QKeySequence
+from PySide6.QtCore import QDateTime, QEvent, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -40,6 +41,7 @@ from imagesuite.editor.workspace import EditorWorkspace
 from imagesuite.jobs import JobManager
 from imagesuite.similarity.workspace import SimilarityWorkspace
 from imagesuite.upscale.workspace import UpscaleWorkspace
+from imagesuite.updater import RELEASES_PAGE_URL, UpdateClient, UpdateInfo, launch_installer_after_exit
 from imagesuite.utils import IMAGE_FILE_FILTER, app_data_dir, expand_image_paths, open_folder
 
 
@@ -94,6 +96,15 @@ class PreferencesDialog(QDialog):
         self.restore_tabs.setToolTip("Tabs are restored one at a time after the window opens to keep startup responsive")
         form.addRow("Session", self.restore_tabs)
 
+        self.auto_updates = QCheckBox("Check for ImageSuite updates automatically")
+        self.auto_updates.setChecked(settings.value("updates/automatic", True, type=bool))
+        self.auto_updates.setToolTip("Checks GitHub Releases at most once per day. Updates are downloaded only after confirmation.")
+        form.addRow("Updates", self.auto_updates)
+
+        self.prerelease_updates = QCheckBox("Include release candidates")
+        self.prerelease_updates.setChecked(settings.value("updates/include_prereleases", "RC" in __version__, type=bool))
+        form.addRow("Update channel", self.prerelease_updates)
+
         output_holder = QWidget()
         output_row = QHBoxLayout(output_holder)
         output_row.setContentsMargins(0, 0, 0, 0)
@@ -126,6 +137,8 @@ class PreferencesDialog(QDialog):
         self.autosave.setValue(30)
         self.preserve_metadata.setChecked(True)
         self.restore_tabs.setChecked(True)
+        self.auto_updates.setChecked(True)
+        self.prerelease_updates.setChecked("RC" in __version__)
         self.output.clear()
 
     def save(self) -> None:
@@ -135,6 +148,8 @@ class PreferencesDialog(QDialog):
         self.settings.setValue("preferences/autosave_seconds", self.autosave.value())
         self.settings.setValue("preferences/preserve_metadata", self.preserve_metadata.isChecked())
         self.settings.setValue("preferences/restore_editor_tabs", self.restore_tabs.isChecked())
+        self.settings.setValue("updates/automatic", self.auto_updates.isChecked())
+        self.settings.setValue("updates/include_prereleases", self.prerelease_updates.isChecked())
         self.settings.setValue("preferences/default_output", self.output.text().strip())
 
 
@@ -242,6 +257,14 @@ class MainWindow(QMainWindow):
             else QSettings("Regendx", "ImageSuite")
         )
         self.jobs = JobManager()
+        self.update_client = UpdateClient(self)
+        self._manual_update_check = False
+        self._update_progress: QProgressDialog | None = None
+        self.update_client.updateAvailable.connect(self._update_available)
+        self.update_client.noUpdateAvailable.connect(self._no_update_available)
+        self.update_client.errorOccurred.connect(self._update_error)
+        self.update_client.downloadProgress.connect(self._update_download_progress)
+        self.update_client.downloadReady.connect(self._update_download_ready)
         self.setWindowTitle(f"ImageSuite {__version__}")
         self.resize(1500, 900)
         self.setMinimumSize(1120, 700)
@@ -252,6 +275,7 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         QApplication.instance().installEventFilter(self)
         QTimer.singleShot(0, self._restore_workspace_state)
+        QTimer.singleShot(2500, self._automatic_update_check)
 
     def _build_ui(self) -> None:
         root = QWidget(objectName="AppRoot")
@@ -400,6 +424,9 @@ class MainWindow(QMainWindow):
         preferences = QAction("Preferences…", self)
         preferences.triggered.connect(self.show_preferences)
         help_menu.addAction(preferences)
+        update_action = QAction("Check for updates…", self)
+        update_action.triggered.connect(lambda: self.check_for_updates(manual=True))
+        help_menu.addAction(update_action)
         help_menu.addSeparator()
         output_action = QAction("Open output folder", self)
         output_action.triggered.connect(lambda: open_folder(self.upscale.output_edit.text()))
@@ -560,6 +587,7 @@ class MainWindow(QMainWindow):
             "Find similar images": self.similarity.choose_source,
             "Open output folder": lambda: open_folder(self.upscale.output_edit.text()),
             "Preferences": self.show_preferences,
+            "Check for updates": lambda: self.check_for_updates(manual=True),
             "Copy diagnostics": lambda: QApplication.clipboard().setText(diagnostics_report(self.base_dir, include_ai=True)),
             "Switch to Edit": lambda: self.switch_page(0),
             "Switch to Enhance": lambda: self.switch_page(1),
@@ -568,6 +596,100 @@ class MainWindow(QMainWindow):
         choice, accepted = QInputDialog.getItem(self, "Command palette", "Action", list(actions), 0, False)
         if accepted and choice:
             actions[choice]()
+
+    def _automatic_update_check(self) -> None:
+        if not UpdateClient.supported_installation():
+            return
+        if not self.settings.value("updates/automatic", True, type=bool):
+            return
+        previous = self.settings.value("updates/last_check")
+        if previous:
+            checked = QDateTime.fromString(str(previous), Qt.ISODate)
+            if checked.isValid() and checked.secsTo(QDateTime.currentDateTimeUtc()) < 24 * 60 * 60:
+                return
+        self.check_for_updates(manual=False)
+
+    def check_for_updates(self, *, manual: bool = True) -> None:
+        self._manual_update_check = manual
+        if manual:
+            self.set_status("Checking for updates…")
+        include_prereleases = self.settings.value("updates/include_prereleases", "RC" in __version__, type=bool)
+        self.update_client.check(include_prereleases=include_prereleases)
+
+    def _update_available(self, info: UpdateInfo) -> None:
+        self.settings.setValue("updates/last_check", QDateTime.currentDateTimeUtc().toString(Qt.ISODate))
+        self.set_status(f"ImageSuite {info.version} is available")
+        notes = info.notes.strip()
+        if len(notes) > 1800:
+            notes = notes[:1800].rstrip() + "…"
+        message = f"ImageSuite {info.version} is available.\n\n{notes}" if notes else f"ImageSuite {info.version} is available."
+        if info.asset is None:
+            result = QMessageBox.question(self, "ImageSuite update", message + "\n\nNo Windows installer is attached. Open the release page?", QMessageBox.Open | QMessageBox.Cancel)
+            if result == QMessageBox.Open:
+                QDesktopServices.openUrl(QUrl(info.page_url or RELEASES_PAGE_URL))
+            return
+        result = QMessageBox.question(self, "ImageSuite update", message + "\n\nDownload the installer now?", QMessageBox.Yes | QMessageBox.No)
+        if result == QMessageBox.Yes:
+            self._update_progress = QProgressDialog("Downloading ImageSuite update…", "Cancel", 0, max(0, info.asset.size), self)
+            self._update_progress.setWindowTitle("ImageSuite update")
+            self._update_progress.setMinimumDuration(0)
+            self._update_progress.canceled.connect(self._cancel_update_download)
+            self._update_progress.show()
+            self.update_client.download(info)
+
+    def _no_update_available(self) -> None:
+        self.settings.setValue("updates/last_check", QDateTime.currentDateTimeUtc().toString(Qt.ISODate))
+        self.set_status("ImageSuite is up to date")
+        if self._manual_update_check:
+            QMessageBox.information(self, "ImageSuite update", f"ImageSuite {__version__} is up to date.")
+
+    def _update_error(self, message: str) -> None:
+        if self._update_progress is not None:
+            self._update_progress.close()
+            self._update_progress = None
+        self.set_status("Update check failed")
+        if self._manual_update_check:
+            QMessageBox.warning(self, "ImageSuite update", f"The update could not be completed.\n\n{message}")
+
+    def _cancel_update_download(self) -> None:
+        self.update_client.cancel()
+        self._update_progress = None
+        self.set_status("Update download canceled")
+
+    def _update_download_progress(self, received: int, total: int) -> None:
+        if self._update_progress is None:
+            return
+        if total > 0:
+            self._update_progress.setMaximum(total)
+        self._update_progress.setValue(max(0, received))
+
+    def _update_download_ready(self, installer: Path, info: UpdateInfo) -> None:
+        if self._update_progress is not None:
+            self._update_progress.close()
+            self._update_progress = None
+        result = QMessageBox.question(
+            self,
+            "Install ImageSuite update",
+            f"ImageSuite {info.version} is ready. Close ImageSuite, install it silently, and reopen?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            self.set_status(f"Update downloaded to {installer.name}")
+            return
+        if not launch_installer_after_exit(installer):
+            QMessageBox.warning(self, "ImageSuite update", "The installer could not be scheduled. Open the downloaded installer manually.")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(installer.parent)))
+            return
+        QApplication.quit()
+
+    def receive_external_paths(self, paths: list[Path]) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if paths:
+            self.route_paths(paths)
 
     def show_preferences(self) -> None:
         dialog = PreferencesDialog(self.settings, self)
@@ -717,6 +839,12 @@ class MainWindow(QMainWindow):
             self.editor.tool_tabs.setCurrentIndex(int(self.settings.value("session/editor_panel", 0)))
         except (TypeError, ValueError):
             self.editor.tool_tabs.setCurrentIndex(0)
+        try:
+            splitter_sizes = [int(value) for value in self._setting_list(self.settings, "session/editor_splitter_sizes")]
+        except (TypeError, ValueError):
+            splitter_sizes = []
+        if len(splitter_sizes) == 2 and all(value > 0 for value in splitter_sizes):
+            self.editor.editor_splitter.setSizes(splitter_sizes)
 
     def _restore_next_editor_path(self) -> None:
         queue = getattr(self, "_editor_restore_queue", [])
@@ -741,8 +869,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("session/editor_tool", self.editor.canvas.mode)
         self.settings.setValue("session/editor_advanced", self.editor.advanced_toggle.isChecked())
         self.settings.setValue("session/editor_panel", self.editor.tool_tabs.currentIndex())
+        self.settings.setValue("session/editor_splitter_sizes", self.editor.editor_splitter.sizes())
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self.update_client.cancel()
         active_jobs = [workspace for workspace in (self.upscale, self.similarity) if workspace.is_busy()]
         if active_jobs:
             result = QMessageBox.question(

@@ -276,3 +276,90 @@ def test_similarity_group_loads_only_visible_thumbnails(tmp_path: Path, monkeypa
 
     assert 0 < len(calls) < len(members)
     workspace.close()
+
+
+def test_compare_pixmap_cache_keeps_original_while_preview_changes():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (120, 80), "white"), dirty=False)
+    canvas = workspace.canvas
+    original = workspace.document.original_image
+    first_preview = Image.new("RGBA", (120, 80), "black")
+    canvas.preview_image = first_preview
+
+    first_pixmap = canvas._pixmap(first_preview)
+    original_pixmap = canvas._pixmap(original)
+    assert len(canvas._pixmap_cache) == 2
+    assert canvas._pixmap(first_preview).cacheKey() == first_pixmap.cacheKey()
+    assert canvas._pixmap(original).cacheKey() == original_pixmap.cacheKey()
+
+    second_preview = Image.new("RGBA", (120, 80), "red")
+    canvas.preview_image = second_preview
+    cached_ids = {key[0] for key in canvas._pixmap_cache}
+    assert id(first_preview) not in cached_ids
+    assert id(original) in cached_ids
+    canvas._pixmap(second_preview)
+    assert len(canvas._pixmap_cache) == 2
+    workspace.close()
+
+
+def test_brush_reuses_mask_and_clips_circle_at_image_edge():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (80, 80), "white"), dirty=False)
+    canvas = workspace.canvas
+    workspace.choose_mode("brush_black")
+    canvas.brush_size = 20
+
+    canvas._begin_brush((0, 0))
+    first_mask = canvas._brush_mask_hard
+    assert first_mask is not None
+    assert workspace.document.image.getpixel((0, 0))[:3] == (0, 0, 0)
+    assert workspace.document.image.getpixel((8, 8))[:3] == (255, 255, 255)
+    canvas._stamp((20, 20))
+    assert canvas._brush_mask_hard is first_mask
+    assert workspace.document.image.getpixel((20, 20))[:3] == (0, 0, 0)
+    canvas._finish_brush()
+    workspace.undo()
+    assert workspace.document.image.getpixel((0, 0))[:3] == (255, 255, 255)
+    workspace.redo()
+    assert workspace.document.image.getpixel((20, 20))[:3] == (0, 0, 0)
+    workspace.close()
+
+
+def test_switching_documents_rolls_back_unfinished_brush_stroke():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (100, 100), "white"), dirty=False)
+    workspace.add_document(Image.new("RGBA", (100, 100), "black"), dirty=False)
+    workspace._activate(0)
+    first = workspace.document
+    revision = first.image_revision
+    workspace.choose_mode("brush_black")
+
+    workspace.canvas._begin_brush((50, 50))
+    assert first.image.getpixel((50, 50))[:3] == (0, 0, 0)
+    assert not first.dirty
+
+    workspace._activate(1)
+    assert first.image.getpixel((50, 50))[:3] == (255, 255, 255)
+    assert first.image_revision == revision
+    assert not first.dirty
+    assert workspace.canvas.brush_before is None
+    assert workspace.canvas.brush_source is None
+    workspace.close()
+
+
+def test_closing_workspace_clears_unfinished_brush_buffers():
+    _app()
+    workspace = EditorWorkspace()
+    workspace.add_document(Image.new("RGBA", (100, 100), "white"), dirty=False)
+    workspace.choose_mode("brush_pixel")
+    workspace.canvas._begin_brush((50, 50))
+    assert workspace.canvas.brush_before is not None
+    assert workspace.canvas.brush_source is not None
+
+    workspace.close()
+    assert workspace.canvas.document is None
+    assert workspace.canvas.brush_before is None
+    assert workspace.canvas.brush_source is None
